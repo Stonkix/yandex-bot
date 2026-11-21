@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block content %}
+<nav class="filters" aria-label="Тип отчёта">
+  <a href="{{ url_for('reports') }}" class="{{ 'active' if not kind }}">Все</a>
+  {% for item in kinds %}<a href="{{ url_for('reports', kind=item) }}" class="{{ 'active' if item == kind }}">{{ item }}</a>{% endfor %}
+</nav>
+<section class="card">
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Файл</th><th>Тип</th><th>Изменён</th><th class="num">Размер</th><th></th></tr></thead>
+      <tbody>
+      {% for report in reports %}
+        <tr>
+          <td class="mono">{{ report.name }}</td>
+          <td>{{ report.kind }}</td>
+          <td class="nowrap">{{ report.modified|dt }}</td>
+          <td class="num">{{ report.size|size }}</td>
+          <td class="num"><a class="btn secondary small" href="{{ url_for('download_report', name=report.name) }}">{{ icon('download') }}Скачать</a></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">Отчётов нет.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

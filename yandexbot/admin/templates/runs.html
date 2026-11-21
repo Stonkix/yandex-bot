@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, run_badge, csrf_field with context %}
+{% block content %}
+<form method="post" class="card">
+  {{ csrf_field() }}
+  <div class="card-head">
+    <div><h2>Новый запуск</h2><p class="muted small">Выполняется вне расписания. Пока идёт одна выгрузка цен, следующая и команда /цены ждут очереди.</p></div>
+  </div>
+  <div class="card-body stack">
+    {% if not bot_running %}
+      <div class="flash error">Бот в этом процессе не запущен: задание встанет в очередь, но выполнять его будет некому.</div>
+    {% endif %}
+    <div class="choice-list inline" role="radiogroup" aria-label="Что выгрузить">
+      {% for (module_code, kind), label in kinds.items() %}
+      <label class="choice"><input type="radio" name="job" value="{{ module_code }}:{{ kind }}" {{ 'checked' if loop.first }}>{{ label }}</label>
+      {% endfor %}
+    </div>
+    <div class="form-grid">
+      <label class="field">Куда отправить результат
+        <select name="delivery">
+          {% for value, label in deliveries.items() %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="field" id="target-box" hidden>Чат
+        <select name="target">
+          {% for chat in chats %}<option value="{{ chat.chat_id }}">{{ chat.title }}</option>{% else %}<option value="">Сначала добавьте чаты</option>{% endfor %}
+        </select>
+      </label>
+    </div>
+  </div>
+  <div class="card-foot"><button class="btn">{{ icon('play') }}Поставить в очередь</button></div>
+</form>
+
+<section class="card">
+  <div class="card-head">
+    <div><h2>История запусков</h2>
+      <p class="muted small">Последние 50 заданий{% if auto_refresh %} · страница обновляется каждые {{ auto_refresh }} с{% endif %}</p></div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>№</th><th>Задача</th><th>Статус</th><th>Создано</th><th>Длительность</th><th>Результат</th><th></th></tr></thead>
+      <tbody>
+      {% for run in runs %}
+        <tr>
+          <td class="muted">{{ run.id }}</td>
+          <td><b class="nowrap">{{ run.title }}</b><div class="muted small">{{ run.delivery_title }} · {{ run.requested_by }}</div></td>
+          <td>{{ run_badge(run) }}</td>
+          <td class="nowrap small">{{ run.created_at|dt }}</td>
+          <td class="nowrap small">{{ run.duration or "—" }}</td>
+          <td class="result">{{ run.result }}</td>
+          <td class="num">
+            {% if run.status == "queued" %}
+            <form method="post" action="{{ url_for('cancel_run', run_id=run.id) }}" data-confirm="Отменить задание №{{ run.id }}?">
+              {{ csrf_field() }}<button class="btn danger small">Отменить</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="empty">Запусков ещё не было.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

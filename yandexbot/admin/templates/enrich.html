@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% from "_macros.html" import switch, csrf_field with context %}
+{% block content %}
+<section class="grid grid-3">
+  <div class="card stat">
+    <div class="stat-label">Использовано сегодня</div>
+    <div class="stat-value">{{ usage.used|num }} <span class="muted small">из {{ usage.limit|num }}</span></div>
+    <div class="meter {{ 'full' if usage.percent >= 100 else 'warn' if usage.percent >= 80 }}"><span style="width: {{ usage.percent }}%"></span></div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Осталось на сегодня</div>
+    <div class="stat-value">{{ [usage.limit - usage.used, 0]|max|num }}</div>
+    <div class="stat-note">Счётчик сбрасывается в полночь</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Токен DaData</div>
+    <div class="stat-value">{% if usage.token %}<span class="badge ok">Задан</span>{% else %}<span class="badge bad">Не задан</span>{% endif %}</div>
+    <div class="stat-note">Хранится в config/config.toml, в панели не показывается</div>
+  </div>
+</section>
+
+<section class="grid split">
+  <div class="card">
+    <div class="card-head">
+      <div><h2>Расход по пользователям</h2><p class="muted small">Сколько ИНН обработано</p></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Логин</th><th class="num">Сегодня</th><th class="num">Неделя</th><th class="num">Месяц</th><th class="num">Всего</th></tr></thead>
+        <tbody>
+        {% for row in by_user %}
+          <tr><td>{{ row.login }}</td><td class="num">{{ row.today|num }}</td><td class="num">{{ row.week|num }}</td>
+              <td class="num">{{ row.month|num }}</td><td class="num"><b>{{ row.total|num }}</b></td></tr>
+        {% else %}
+          <tr><td colspan="5" class="empty">Обогащений ещё не было.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <form method="post" class="card">
+    {{ csrf_field() }}
+    <div class="card-head"><div><h2>Настройки</h2><p class="muted small">Команды: {% for command in settings.commands %}<span class="chip">{{ command }}</span>{% endfor %}</p></div></div>
+    <div class="card-body stack">
+      {{ switch("enabled", settings.enabled, "Модуль включён") }}
+      <label class="field">Дневной лимит DaData
+        <input type="number" name="daily_limit" min="1" value="{{ settings.daily_limit }}" required>
+        <small>То же значение меняет команда /лимиты в мессенджере.</small></label>
+      <label class="field">Скорость, запросов в секунду
+        <input type="number" name="requests_per_second" min="1" max="25" value="{{ settings.requests_per_second }}" required>
+        <small>Не больше 25 — ограничение DaData.</small></label>
+    </div>
+    <div class="card-foot"><button class="btn">Сохранить</button></div>
+  </form>
+</section>
+{% endblock %}

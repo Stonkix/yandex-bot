@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, csrf_field with context %}
+{% macro access_row(row) -%}
+<tr>
+  <td><input name="login" value="{{ row.login }}" placeholder="login@company.ru" required spellcheck="false"></td>
+  <td><select name="role" aria-label="Роль">
+    <option value="employee" {{ 'selected' if row.role == 'employee' }}>Сотрудник</option>
+    <option value="admin" {{ 'selected' if row.role == 'admin' }}>Администратор</option></select></td>
+  <td class="num"><button type="button" class="btn danger small icon-btn" data-remove-row title="Удалить строку" aria-label="Удалить строку">{{ icon('trash') }}</button></td>
+</tr>
+{%- endmacro %}
+{% block content %}
+<section class="grid split">
+  <form method="post" class="card">
+    {{ csrf_field() }}
+    <div class="card-head">
+      <div>
+        <h2>Доступ к командам в мессенджере</h2>
+        <p class="muted small">Сотрудник может пользоваться /обогатить в личных сообщениях. Администратору доступны все команды в любом чате.</p>
+      </div>
+      <button type="button" class="btn secondary small" data-add-row="#access-body" data-template="access-template">{{ icon('plus') }}Выдать доступ</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Логин</th><th>Роль</th><th></th></tr></thead>
+        <tbody id="access-body">
+        {% for row in rows %}{{ access_row(row) }}{% else %}
+          <tr class="empty-row"><td colspan="3" class="empty">Доступы ещё не выданы.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="card-foot"><button class="btn">Сохранить доступы</button></div>
+  </form>
+
+  <aside class="stack">
+    <form method="post" action="{{ url_for('access_add') }}" class="card">
+      {{ csrf_field() }}
+      <div class="card-head"><div><h2>Выдать доступ</h2><p class="muted small">Действует сразу, перезапуск не нужен</p></div></div>
+      <div class="card-body stack">
+        <label class="field">Логин в Яндекс Мессенджере
+          <input name="login" placeholder="login@company.ru" required spellcheck="false" autocomplete="off">
+          <small>Узнать логин: пусть человек напишет боту /whoami.</small></label>
+        <label class="field">Роль
+          <select name="role">
+            <option value="employee">Сотрудник — /обогатить в личке</option>
+            <option value="admin">Администратор — все команды везде</option>
+          </select></label>
+      </div>
+      <div class="card-foot"><button class="btn">{{ icon('plus') }}Выдать</button></div>
+    </form>
+
+    <div class="card">
+      <div class="card-head"><div><h2>config.toml</h2><p class="muted small">Секция [access]</p></div></div>
+      <div class="card-body stack">
+        {% if pending.admin or pending.employee %}
+          <p>В config.toml есть логины, которых нет в списке. Они <b>не действуют</b>, пока их не перенести:</p>
+          {% if pending.admin %}<div><div class="stat-label">Администраторы</div>
+            <div style="margin-top:6px">{% for login in pending.admin %}<span class="chip">{{ login }}</span>{% endfor %}</div></div>{% endif %}
+          {% if pending.employee %}<div><div class="stat-label">Сотрудники</div>
+            <div style="margin-top:6px">{% for login in pending.employee %}<span class="chip">{{ login }}</span>{% endfor %}</div></div>{% endif %}
+          <form method="post" action="{{ url_for('access_import_config') }}">
+            {{ csrf_field() }}<button class="btn secondary">Перенести в список</button>
+          </form>
+        {% else %}
+          <p class="note small">Логины из config.toml уже перенесены в список слева. Доступами управляет только панель: их можно понизить или удалить здесь, секция [access] больше прав не выдаёт.</p>
+        {% endif %}
+      </div>
+    </div>
+  </aside>
+</section>
+<template id="access-template">{{ access_row({"login": "", "role": "employee"}) }}</template>
+{% endblock %}

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, csrf_field with context %}
+{% macro chat_row(chat) -%}
+<tr>
+  <td><input name="chat_id" value="{{ chat.chat_id }}" placeholder="0/0/xxxxxxxx-…" required spellcheck="false" class="mono"></td>
+  <td><input name="title" value="{{ chat.title }}" placeholder="Название"></td>
+  <td><input type="hidden" name="broadcast" value="{{ 1 if chat.broadcast else 0 }}">
+    {% for title in chat_modules.get(chat.chat_id, []) %}<span class="chip">{{ title }}</span>{% else %}<span class="muted small">—</span>{% endfor %}</td>
+  <td><select name="commands" aria-label="Команды">
+    <option value="1" {{ 'selected' if chat.commands }}>Да</option>
+    <option value="0" {{ 'selected' if not chat.commands }}>Нет</option></select></td>
+  <td class="num"><button type="button" class="btn danger small icon-btn" data-remove-row title="Удалить строку" aria-label="Удалить строку">{{ icon('trash') }}</button></td>
+</tr>
+{%- endmacro %}
+{% block content %}
+<form method="post" class="card">
+  {{ csrf_field() }}
+  <div class="card-head">
+    <div>
+      <h2>Групповые чаты бота</h2>
+      <p class="muted small">«Рассылки» — какие модули присылают сюда итоги; выбирается на страницах
+        <a href="{{ url_for('prices') }}">«Цены 1СО»</a> и <a href="{{ url_for('epd_prices_page') }}">«Цены ЭПД»</a>.
+        «Команды» — в чате всем участникам доступны /цены, /эпд-цены и /обогатить.
+        ID чата можно узнать командой /whoami прямо в нужном чате.</p>
+    </div>
+    <button type="button" class="btn secondary small" data-add-row="#chats-body" data-template="chat-template">{{ icon('plus') }}Добавить чат</button>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID чата</th><th>Название</th><th>Рассылки</th><th>Команды</th><th></th></tr></thead>
+      <tbody id="chats-body">
+      {% for chat in chats %}{{ chat_row(chat) }}{% else %}
+        <tr class="empty-row"><td colspan="5" class="empty">Чаты ещё не добавлены.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-foot"><button class="btn">Сохранить чаты</button></div>
+</form>
+<template id="chat-template">{{ chat_row({"chat_id": "", "title": "", "broadcast": 0, "commands": 0}) }}</template>
+{% endblock %}

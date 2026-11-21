@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% from "_macros.html" import csrf_field with context %}
+{% block content %}
+<section class="grid grid-2" style="align-items:start">
+  <div class="card">
+    <div class="card-head"><h2>Учётная запись панели</h2></div>
+    <div class="card-body">
+      <dl class="kv">
+        <dt>Логин</dt><dd>{{ account.username }}</dd>
+        <dt>Создана</dt><dd>{{ account.created_at|dt }}</dd>
+        <dt>Последний вход</dt><dd>{{ account.last_login_at|dt }}</dd>
+      </dl>
+      <p class="note small" style="margin-top:14px">Сессия действует 12 часов. После 5 неудачных попыток вход с того же адреса блокируется на 10 минут.</p>
+    </div>
+  </div>
+
+  <form method="post" class="card">
+    {{ csrf_field() }}
+    <div class="card-head"><h2>Смена пароля</h2></div>
+    <div class="card-body stack">
+      <label class="field">Текущий пароль<input type="password" name="current_password" autocomplete="current-password" required></label>
+      <label class="field">Новый пароль<input type="password" name="new_password" minlength="10" autocomplete="new-password" required>
+        <small>Не короче 10 символов.</small></label>
+      <label class="field">Повторите новый пароль<input type="password" name="new_password2" minlength="10" autocomplete="new-password" required></label>
+    </div>
+    <div class="card-foot"><button class="btn">Изменить пароль</button></div>
+  </form>
+</section>
+{% endblock %}

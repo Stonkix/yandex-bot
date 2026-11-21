@@ -1,0 +1,19 @@
+# Добавьте эти секции в config.toml. Секретов здесь нет.
+
+[modules.prices]
+enabled = true
+commands = ["/цены", "/цена"]
+
+[modules.prices.manual]
+# Ручной запуск отвечает в чат, откуда пришла команда, и работает без общего таймаута.
+sbis_delay_sec = 0.3
+kontur_region_delay_sec = 1.0
+
+[modules.prices.auto]
+enabled = true
+interval_days = 7
+at = "02:30"
+# Плановый запуск отправляет результат в чаты с broadcast = true.
+# Увеличивайте паузы для более медленного ночного разбора.
+sbis_delay_sec = 1.0
+kontur_region_delay_sec = 10.0

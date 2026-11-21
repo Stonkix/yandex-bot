@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, onoff, run_badge, next_run %}
+{% block content %}
+<section class="grid grid-4">
+  <div class="card stat">
+    <div class="stat-label">Цены 1СО — последняя выгрузка</div>
+    <div class="stat-value">{{ last_prices|dt if last_prices else "—" }}</div>
+    <div class="stat-note">Следующая плановая: {{ next_run(schedule) }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Цены ЭПД — последняя выгрузка</div>
+    <div class="stat-value">{{ last_epd|dt if last_epd else "—" }}</div>
+    <div class="stat-note">Следующая плановая: {{ next_run(epd_schedule) }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">DaData сегодня</div>
+    <div class="stat-value">{{ usage.used|num }} <span class="muted small">из {{ usage.limit|num }}</span></div>
+    <div class="meter {{ 'full' if usage.percent >= 100 else 'warn' if usage.percent >= 80 }}"><span style="width: {{ usage.percent }}%"></span></div>
+    {% if not usage.token %}<div class="stat-note">Токен DaData не задан в config.toml</div>{% endif %}
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Чаты и доступы</div>
+    <div class="stat-value">{{ chat_counts.total }} <span class="muted small">чатов</span></div>
+    <div class="stat-note">Рассылка 1СО: {{ chat_counts.prices }} · ЭПД: {{ chat_counts.epd }} · команды: {{ chat_counts.commands }} ·
+      админов: {{ access_counts.admin }} · сотрудников: {{ access_counts.employee }}</div>
+  </div>
+</section>
+
+<section class="grid grid-2">
+  <div class="card">
+    <div class="card-head">
+      <div><h2>Модули</h2><p class="muted small">Состояние и команды в мессенджере</p></div>
+      <a class="btn secondary small" href="{{ url_for('modules') }}">Настроить</a>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+        {% for code, settings in modules.items() %}
+          <tr>
+            <td><b>{{ module_titles[code] }}</b></td>
+            <td>{% for command in settings.commands %}<span class="chip">{{ command }}</span>{% endfor %}</td>
+            <td class="num">{{ onoff(settings.enabled) }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>Плановые выгрузки</h2><p class="muted small">Итоги и Excel уходят в чаты рассылки модуля</p></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Выгрузка</th><th>Расписание</th><th>Следующая</th></tr></thead>
+        <tbody>
+        {% for label, item, endpoint in [("Цены 1СО", schedule, "prices"), ("Цены ЭПД", epd_schedule, "epd_prices_page")] %}
+          <tr>
+            <td><a href="{{ url_for(endpoint) }}"><b>{{ label }}</b></a>
+              <div class="muted small">прошлая: {{ item.last|dt }}</div></td>
+            <td>{% if item.module_enabled and item.auto_enabled %}раз в {{ item.interval_days }} дн., {{ item.at }}{% else %}{{ onoff(false) }}{% endif %}</td>
+            <td class="small">{{ next_run(item) }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="grid grid-2">
+  <div class="card">
+    <div class="card-head">
+      <div><h2>Последние запуски</h2><p class="muted small">Задания, поставленные из панели</p></div>
+      <a class="btn small" href="{{ url_for('runs') }}">{{ icon('play') }}Новый запуск</a>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+        {% for run in runs %}
+          <tr>
+            <td><b>{{ run.title }}</b><div class="muted small">№{{ run.id }} · {{ run.created_at|dt }}</div></td>
+            <td class="num">{{ run_badge(run) }}</td>
+          </tr>
+        {% else %}
+          <tr><td class="empty">Запусков из панели ещё не было.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>Свежие отчёты</h2><p class="muted small">Файлы в stat/</p></div>
+      <a class="btn secondary small" href="{{ url_for('reports') }}">Все отчёты</a>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+        {% for report in reports %}
+          <tr>
+            <td><a href="{{ url_for('download_report', name=report.name) }}">{{ report.name }}</a>
+              <div class="muted small">{{ report.kind }}</div></td>
+            <td class="num muted small">{{ report.modified|dt }}</td>
+          </tr>
+        {% else %}
+          <tr><td class="empty">Отчётов пока нет.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+{% endblock %}

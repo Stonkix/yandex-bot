@@ -1,0 +1,32 @@
+{% extends "auth_base.html" %}
+{% from "_macros.html" import csrf_field with context %}
+{% block content %}
+{% if mode == "setup" %}
+  <h1>Первичная настройка</h1>
+  <p class="muted">Задайте пароль администратора. Логин — <b>admin</b>.</p>
+  <form method="post" class="stack">
+    {{ csrf_field() }}
+    <label class="field">Пароль
+      <input type="password" name="password" minlength="10" autocomplete="new-password" required autofocus>
+      <small>Не короче 10 символов.</small>
+    </label>
+    <label class="field">Повторите пароль
+      <input type="password" name="password2" minlength="10" autocomplete="new-password" required>
+    </label>
+    <button class="btn">Сохранить и войти</button>
+  </form>
+{% else %}
+  <h1>Вход</h1>
+  <p class="muted">Панель управления Яндекс-ботом</p>
+  <form method="post" class="stack">
+    {{ csrf_field() }}
+    <label class="field">Логин
+      <input name="username" value="admin" autocomplete="username" required>
+    </label>
+    <label class="field">Пароль
+      <input type="password" name="password" autocomplete="current-password" required autofocus>
+    </label>
+    <button class="btn">Войти</button>
+  </form>
+{% endif %}
+{% endblock %}

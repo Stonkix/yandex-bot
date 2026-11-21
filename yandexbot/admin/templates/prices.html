@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% from "_macros.html" import switch, onoff, next_run, broadcast_picker, csrf_field with context %}
+{% block content %}
+{% set auto = settings.auto %}{% set manual = settings.manual %}
+<section class="grid split">
+  <form method="post" class="card">
+    {{ csrf_field() }}
+    <div class="card-head">
+      <div><h2>Выгрузка цен СБИС и Контур.Экстерн</h2><p class="muted small">Расписание и скорость парсинга</p></div>
+      {{ switch("enabled", settings.enabled, "Модуль включён") }}
+    </div>
+    <div class="card-body stack">
+      <fieldset>
+        <legend>Плановый ночной запуск</legend>
+        <div class="stack">
+          {{ switch("auto_enabled", auto.enabled, "Запускать по расписанию") }}
+          {{ switch("only_changes", auto.only_changes, "Отправлять только при изменении цен") }}
+          <p class="muted small">Если цены такие же, как в прошлой выгрузке, плановый итог в чаты не отправляется (Excel и история всё равно сохраняются). Ошибки источников и первая выгрузка отправляются всегда; команда в чате и «Запуски» — тоже всегда.</p>
+          <div class="form-grid">
+            <label class="field">Интервал, дней
+              <input type="number" name="interval_days" min="1" value="{{ auto.interval_days }}" required></label>
+            <label class="field">Не раньше, чем в
+              <input type="time" name="at" value="{{ auto.at }}" required>
+              <small>Запуск — в течение 5 минут после этого времени</small></label>
+            <label class="field">Пауза СБИС, с
+              <input type="number" name="auto_sbis_delay_sec" min="0" step="0.1" value="{{ auto.sbis_delay_sec }}" required>
+              <small>между регионами</small></label>
+            <label class="field">Пауза Контур, с
+              <input type="number" name="auto_kontur_region_delay_sec" min="0" step="0.1" value="{{ auto.kontur_region_delay_sec }}" required>
+              <small>между регионами</small></label>
+          </div>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Ручной запуск (команда и «Запуски»)</legend>
+        <div class="stack">
+          {{ switch("main_files_only", manual.main_files_only, "Только два основных прайс-листа Контура") }}
+          <div class="form-grid">
+            <label class="field">Пауза СБИС, с
+              <input type="number" name="manual_sbis_delay_sec" min="0" step="0.1" value="{{ manual.sbis_delay_sec }}" required></label>
+            <label class="field">Пауза Контур, с
+              <input type="number" name="manual_kontur_region_delay_sec" min="0" step="0.1" value="{{ manual.kontur_region_delay_sec }}" required></label>
+          </div>
+        </div>
+      </fieldset>
+      {{ broadcast_picker(picker) }}
+    </div>
+    <div class="card-foot"><button class="btn">Сохранить настройки</button></div>
+  </form>
+
+  <aside class="card">
+    <div class="card-head"><h2>Состояние</h2></div>
+    <div class="card-body">
+      <dl class="kv">
+        <dt>Модуль</dt><dd>{{ onoff(schedule.module_enabled) }}</dd>
+        <dt>По расписанию</dt><dd>{{ onoff(schedule.auto_enabled) }}</dd>
+        <dt>Последняя выгрузка</dt><dd>{{ last_prices|dt }}</dd>
+        <dt>Последний плановый</dt><dd>{{ schedule.last|dt }}</dd>
+        <dt>Следующий</dt><dd>{{ next_run(schedule) }}</dd>
+        <dt>Команды</dt><dd>{% for command in settings.commands %}<span class="chip">{{ command }}</span>{% endfor %}</dd>
+      </dl>
+      <p class="note small" style="margin-top:14px">Запустить выгрузку вне расписания можно на странице <a href="{{ url_for('runs') }}">«Запуски»</a>.</p>
+    </div>
+  </aside>
+</section>
+{% endblock %}

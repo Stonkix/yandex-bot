@@ -1,0 +1,91 @@
+{% from "_macros.html" import icon, csrf_field with context %}
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} · Панель бота</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+{% if auto_refresh %}<meta http-equiv="refresh" content="{{ auto_refresh }}">{% endif %}
+</head>
+<body>
+{% set nav = [
+  (None, [("dashboard", "Обзор", "home")]),
+  ("Настройки", [("modules", "Модули", "grid"), ("prices", "Цены 1СО", "tag"),
+                 ("epd_prices_page", "Цены ЭПД", "truck"),
+                 ("enrich_page", "Обогащение ИНН", "search"), ("chats", "Чаты", "chat"),
+                 ("access", "Доступы", "users")]),
+  ("Работа", [("runs", "Запуски", "play"), ("reports", "Отчёты", "file"), ("logs", "Журнал", "list")]),
+] %}
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">ЯБ</div>
+      <div><b>Яндекс-бот</b><span>Панель управления</span></div>
+    </div>
+    {% for group, items in nav %}
+      {% if group %}<div class="nav-group">{{ group }}</div>{% endif %}
+      {% for endpoint, label, ic in items %}
+        <a class="nav-link {{ 'active' if request.endpoint == endpoint }}" href="{{ url_for(endpoint) }}"
+           {% if request.endpoint == endpoint %}aria-current="page"{% endif %} title="{{ label }}">{{ icon(ic) }}<span>{{ label }}</span></a>
+      {% endfor %}
+    {% endfor %}
+    <div class="sidebar-bottom">
+      <a class="nav-link {{ 'active' if request.endpoint == 'account' }}" href="{{ url_for('account') }}" title="Аккаунт">{{ icon('user') }}<span>{{ user }}</span></a>
+      <form method="post" action="{{ url_for('logout') }}">
+        {{ csrf_field() }}
+        <button class="nav-link as-button" title="Выйти">{{ icon('logout') }}<span>Выйти</span></button>
+      </form>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1>{{ title }}</h1>
+      <div class="status-strip">
+        {% for item in bot_status %}
+          <span class="badge {{ 'ok' if item.ok else 'bad' }}" title="Последняя активность: {{ item.age }}">{{ item.title }}</span>
+        {% else %}
+          <span class="badge wait" title="Панель запущена отдельно: задания из очереди выполнять некому">Бот не запущен в этом процессе</span>
+        {% endfor %}
+      </div>
+    </header>
+    <div class="content">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+          <div class="flash {{ category if category in ['success', 'error', 'info'] else 'info' }}" role="status">{{ message }}</div>
+        {% endfor %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</div>
+<script>
+// Динамические строки таблиц (чаты, доступы) и подтверждения опасных действий.
+document.addEventListener("click", (event) => {
+  const add = event.target.closest("[data-add-row]");
+  if (add) {
+    const body = document.querySelector(add.dataset.addRow);
+    body.querySelector(".empty-row")?.remove();
+    body.append(document.getElementById(add.dataset.template).content.cloneNode(true));
+    body.lastElementChild.querySelector("input")?.focus();
+  }
+  const remove = event.target.closest("[data-remove-row]");
+  if (remove) remove.closest("tr").remove();
+});
+document.addEventListener("submit", (event) => {
+  const message = event.target.dataset.confirm;
+  if (message && !confirm(message)) event.preventDefault();
+});
+function syncDelivery() {
+  const select = document.querySelector("select[name=delivery]");
+  const box = document.getElementById("target-box");
+  if (!select || !box) return;
+  box.hidden = select.value !== "chat";
+  box.querySelector("select").required = select.value === "chat";
+}
+document.addEventListener("change", (event) => { if (event.target.name === "delivery") syncDelivery(); });
+syncDelivery();
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% from "_macros.html" import switch, csrf_field with context %}
+{% block content %}
+<p class="muted">Включайте и выключайте модули и меняйте их команды в мессенджере. Изменения применяются сразу, перезапуск бота не нужен.</p>
+<section class="grid grid-3">
+  {% for card in cards %}
+  <form method="post" class="card" style="display:flex;flex-direction:column">
+    {{ csrf_field() }}
+    <input type="hidden" name="module" value="{{ card.code }}">
+    <div class="card-head">
+      <div><h2>{{ card.title }}</h2><p class="muted small">{{ card.description }}</p></div>
+    </div>
+    <div class="card-body stack" style="flex:1">
+      {{ switch("enabled", card.settings.enabled, "Модуль включён") }}
+      <label class="field">Команды
+        <textarea name="commands" rows="3" spellcheck="false">{{ card.settings.commands|join("\n") }}</textarea>
+        <small>По одной на строку, начинаются с «/». Команда не может принадлежать двум модулям.</small>
+      </label>
+    </div>
+    <div class="card-foot"><button class="btn">Сохранить</button></div>
+  </form>
+  {% endfor %}
+</section>
+{% endblock %}
