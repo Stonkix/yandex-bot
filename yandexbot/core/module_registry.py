@@ -17,6 +17,7 @@ class CommandContext:
     target: dict | None
     text: str
     display_name: str
+    update_id: int | None = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[None]]

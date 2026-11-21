@@ -65,7 +65,6 @@ from yandexbot.core.utils import short_error, staged_report
 #    и запоминает, от кого именно ждёт файл;
 # 2) следующий файл именно от этого отправителя берём в работу; файлы
 #    от других людей, пока идёт ожидание, игнорируем.
-_pending_enrich: dict[tuple[str, str], float] = {}
 COMMAND_MODULES = ModuleRegistry()
 
 
@@ -123,7 +122,8 @@ def _load_offset() -> int | None:
 
 def _save_offset(offset: int):
     try:
-        config.OFFSET_FILE.write_text(str(offset), encoding="utf-8")
+        with staged_report(config.OFFSET_FILE) as saved:
+            Path(saved).write_text(str(offset), encoding="utf-8", newline="\n")
     except Exception as e:
         logging.error(f"Не удалось сохранить {config.OFFSET_FILE}: {e}")
 
@@ -131,12 +131,6 @@ def _save_offset(offset: int):
 # ─── Обработчик команды /цены ──────────────────────────────────────────────────
 
 async def _handle_prices(display_name: str, target: dict | None):
-    if prices_lock.locked():
-        await ym_send_text(
-            f'⏳ Выгрузка цен уже выполняется — команда от "{display_name}" пропущена.',
-            target=target,
-        )
-        return
     async with prices_lock:
         announce = f'🔄 Принял команду от "{display_name}", запускаю выгрузку СБИС + Контур…'
         try:
@@ -158,16 +152,10 @@ async def _dispatch_prices(context: CommandContext) -> None:
     if not _prices_allowed_here(context.chat, context.sender):
         await ym_send_text("❌ В этом чате/у вас нет доступа к этой команде.", target=context.target)
         return
-    asyncio.create_task(_handle_prices(context.display_name, context.target))
+    _enqueue_price_command(context, "prices")
 
 
 async def _handle_epd_prices(display_name: str, target: dict | None):
-    if epd_prices_lock.locked():
-        await ym_send_text(
-            f'⏳ Выгрузка цен ЭПД уже выполняется — команда от "{display_name}" пропущена.',
-            target=target,
-        )
-        return
     async with epd_prices_lock:
         try:
             await epd_prices.run(
@@ -188,7 +176,18 @@ async def _dispatch_epd_prices(context: CommandContext) -> None:
     if not _prices_allowed_here(context.chat, context.sender):
         await ym_send_text("❌ В этом чате/у вас нет доступа к этой команде.", target=context.target)
         return
-    asyncio.create_task(_handle_epd_prices(context.display_name, context.target))
+    _enqueue_price_command(context, "epd_prices")
+
+
+def _enqueue_price_command(context: CommandContext, kind: str) -> None:
+    if context.update_id is None:
+        handler = _handle_prices if kind == "prices" else _handle_epd_prices
+        asyncio.create_task(handler(context.display_name, context.target))
+        return
+    admin_store.enqueue_chat_job(config.ADMIN_DB_PATH, context.update_id, kind, {
+        "chat": context.chat, "sender": context.sender, "target": context.target,
+        "display_name": context.display_name,
+    })
 
 
 COMMAND_MODULES.register_module(BotModule(
@@ -278,6 +277,48 @@ def _save_enrichment_report(source: str, output: Path, results: list[dict]) -> N
             enrich.save_enriched_source_excel(source, staged, results)
 
 
+def _prepare_enrichment_parts(output: Path, max_bytes: int) -> list[Path]:
+    with tempfile.TemporaryDirectory(prefix=".enrich_parts_", dir=output.parent) as folder:
+        staged = enrich.split_enrichment_report(output, Path(folder), max_bytes)
+        parts = []
+        for path in staged:
+            destination = output.with_name(path.name)
+            path.replace(destination)
+            parts.append(destination)
+        return parts
+
+
+async def _send_enrichment_report(output: Path, caption: str, target: dict | None) -> str:
+    size = output.stat().st_size
+    if size <= YM_MAX_FILE_BYTES:
+        errors = await ym_send_file(str(output), caption=caption, target=target)
+        if not errors:
+            return ""
+        if size < YM_MAX_FILE_BYTES * 0.75 or not any("HTTP 413" in error for error in errors):
+            return "⚠ Яндекс Мессенджер не подтвердил отправку файла."
+        max_bytes = YM_MAX_FILE_BYTES // 2
+    else:
+        max_bytes = YM_MAX_FILE_BYTES
+
+    try:
+        parts = await asyncio.to_thread(_prepare_enrichment_parts, output, max_bytes)
+    except (OSError, ValueError):
+        logging.exception("[DaData] Не удалось разделить %s", output.name)
+        return (
+            f"📎 Файл весит {size / 1_000_000:.1f} МБ. "
+            f"Лимит вложения бота — {YM_MAX_FILE_BYTES / 1_000_000:g} МБ."
+        )
+
+    unsuccessful = []
+    for number, path in enumerate(parts, 1):
+        errors = await ym_send_file(str(path), caption=f"Часть {number} из {len(parts)} · {caption}", target=target)
+        if errors:
+            unsuccessful.append(str(number))
+    if unsuccessful:
+        return f"⚠ Не подтверждена отправка частей Excel: {', '.join(unsuccessful)}."
+    return f"📎 Активный лист отправлен частями ({len(parts)} файлов Excel)."
+
+
 async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dict | None):
     display_name = sender.get("display_name") or sender.get("login") or "пользователь"
     if not config.enrich_module_settings()["enabled"]:
@@ -286,10 +327,6 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
     if not config.DADATA_TOKEN:
         await ym_send_text("❌ Токен DaData не настроен в config.toml ([dadata] token = ...)", target=target)
         return
-    if enrich_lock.locked():
-        await ym_send_text(f'⏳ Обогащение ИНН уже выполняется — команда от "{display_name}" пропущена.', target=target)
-        return
-
     async with enrich_lock:
         tmp_dir = tempfile.mkdtemp(prefix="enrich_")
         ext = os.path.splitext(file_name)[1].lower()
@@ -407,21 +444,9 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
             size_bytes = out_path.stat().st_size
             logging.info("[DaData] Отчёт сохранён: %s (%d байт)", out_path.name, size_bytes)
 
-            delivery_note = ""
-            if size_bytes > YM_MAX_FILE_BYTES:
-                logging.info("[DaData] Отчёт %s превышает лимит вложения ЯМ", out_path.name)
-                delivery_note = (
-                    f"📎 Файл весит {size_bytes / 1_000_000:.1f} МБ. "
-                    f"Лимит вложения бота — {YM_MAX_FILE_BYTES / 1_000_000:g} МБ."
-                )
-            else:
-                errors = await ym_send_file(
-                    str(out_path),
-                    caption=f"ИНН: найдено {found}, не найдено {not_found}, ошибок {failed}",
-                    target=target,
-                )
-                if errors:
-                    delivery_note = "⚠ Яндекс Мессенджер не подтвердил отправку файла."
+            delivery_note = await _send_enrichment_report(
+                out_path, f"ИНН: найдено {found}, не найдено {not_found}, ошибок {failed}", target,
+            )
 
             remaining_left = daily_limit - usage["count"]
             elapsed = enrich.format_duration(time.monotonic() - started_at)
@@ -462,10 +487,7 @@ async def _dispatch_enrich(context: CommandContext) -> None:
     key = _enrich_request_key(context.chat, context.sender)
     if key is None or context.target is None:
         return
-    now = time.monotonic()
-    for expired in [item for item, expires in _pending_enrich.items() if expires <= now]:
-        del _pending_enrich[expired]
-    _pending_enrich[key] = now + config.PENDING_ENRICH_TIMEOUT_SEC
+    admin_store.expect_enrich_file(config.ADMIN_DB_PATH, key, time.time() + config.PENDING_ENRICH_TIMEOUT_SEC)
     await ym_send_text("📎 Жду файл от вас с колонкой «ИНН».", target=context.target)
 
 
@@ -588,6 +610,101 @@ async def _handle_dadata_limit(command_text: str, target: dict | None, actor: st
 
 # ─── Прослушивание чата ────────────────────────────────────────────────────────
 
+async def _process_update(upd: dict) -> None:
+    chat   = upd.get("chat", {}) or {}
+    sender = upd.get("from", {}) or {}
+    target = _reply_target(chat, sender)
+
+    file_info = upd.get("file")
+    text_raw  = (upd.get("text") or "").strip()
+    text      = text_raw.lower().rstrip("!.,;:")
+
+    logging.info(
+        f"[ЯМ] входящее: chat={chat.get('id')} type={chat.get('type')} "
+        f"from={sender.get('login') or sender.get('id')} "
+        f"text={text!r} file={bool(file_info)}"
+    )
+
+    display_name = sender.get("display_name") or sender.get("login") or "пользователь"
+    skey = _sender_key(sender)
+
+    # В личке до выдачи доступа отвечаем на любое входящее сообщение.
+    if chat.get("type") == "private" and not access.has_access(sender):
+        asyncio.create_task(_handle_start(sender, target))
+        return
+
+    # /whoami — доступно всем, в любом чате
+    if text in config.WHOAMI_COMMANDS:
+        asyncio.create_task(_handle_whoami(chat, sender, target))
+        return
+
+    # /start — только в личке
+    if text in config.START_COMMANDS and chat.get("type") == "private":
+        asyncio.create_task(_handle_start(sender, target))
+        return
+
+    if text in config.HELP_COMMANDS:
+        if chat.get("type") == "private" and access.has_access(sender):
+            asyncio.create_task(_handle_help(sender, target))
+        return
+
+    # /статистика_обогатить — только админам
+    if text == config.ENRICH_STATS_COMMAND:
+        if not access.is_admin(sender):
+            asyncio.create_task(
+                ym_send_text("❌ Эта команда доступна только админам.", target=target)
+            )
+            return
+        asyncio.create_task(_handle_enrich_stats(target))
+        return
+
+    # /лимиты [число] — только админам
+    if text == config.DADATA_LIMIT_COMMAND or text.startswith(config.DADATA_LIMIT_COMMAND + " "):
+        if not access.is_admin(sender):
+            asyncio.create_task(
+                ym_send_text("❌ Эта команда доступна только админам.", target=target)
+            )
+            return
+        asyncio.create_task(_handle_dadata_limit(text, target, skey))
+        return
+
+    module_context = CommandContext(
+        chat=chat,
+        sender=sender,
+        target=target,
+        text=text,
+        display_name=display_name,
+        update_id=upd["update_id"],
+    )
+    if text in config.prices_module_settings()["commands"]:
+        await _dispatch_prices(module_context)
+        return
+
+    if text in config.epd_prices_module_settings()["commands"]:
+        await _dispatch_epd_prices(module_context)
+        return
+
+    if text in config.enrich_module_settings()["commands"]:
+        await _dispatch_enrich(module_context)
+        return
+
+    if isinstance(file_info, dict):
+        request_key = _enrich_request_key(chat, sender)
+        if (
+            target and request_key and file_info.get("id") and file_info.get("name")
+            and _enrich_allowed_here(chat, sender)
+        ):
+            admin_store.enqueue_chat_job(config.ADMIN_DB_PATH, upd["update_id"], "enrich", {
+                "chat": chat, "sender": sender, "target": target, "file": {"id": file_info["id"], "name": file_info["name"]},
+            }, request_key=request_key)
+        return
+
+    if text_raw and chat.get("type") == "private" and access.has_access(sender):
+        asyncio.create_task(
+            ym_send_text("❓ Неизвестная команда. Подробнее: /help или /помощь", target=target)
+        )
+
+
 async def listen_commands():
     """
     Слушает ВСЕ чаты, куда добавлен бот (не только один chat_id из config.toml).
@@ -620,105 +737,10 @@ async def listen_commands():
 
             updates = data.get("updates", [])
             for upd in updates:
+                await _process_update(upd)
                 offset = upd["update_id"] + 1
                 _save_offset(offset)
 
-                chat   = upd.get("chat", {}) or {}
-                sender = upd.get("from", {}) or {}
-                target = _reply_target(chat, sender)
-
-                file_info = upd.get("file")
-                text_raw  = (upd.get("text") or "").strip()
-                text      = text_raw.lower().rstrip("!.,;:")
-
-                logging.info(
-                    f"[ЯМ] входящее: chat={chat.get('id')} type={chat.get('type')} "
-                    f"from={sender.get('login') or sender.get('id')} "
-                    f"text={text!r} file={bool(file_info)}"
-                )
-
-                display_name = sender.get("display_name") or sender.get("login") or "пользователь"
-                skey = _sender_key(sender)
-
-                # В личке до выдачи доступа отвечаем на любое входящее сообщение.
-                if chat.get("type") == "private" and not access.has_access(sender):
-                    asyncio.create_task(_handle_start(sender, target))
-                    continue
-
-                # /whoami — доступно всем, в любом чате
-                if text in config.WHOAMI_COMMANDS:
-                    asyncio.create_task(_handle_whoami(chat, sender, target))
-                    continue
-
-                # /start — только в личке
-                if text in config.START_COMMANDS and chat.get("type") == "private":
-                    asyncio.create_task(_handle_start(sender, target))
-                    continue
-
-                if text in config.HELP_COMMANDS:
-                    if chat.get("type") == "private" and access.has_access(sender):
-                        asyncio.create_task(_handle_help(sender, target))
-                    continue
-
-                # /статистика_обогатить — только админам
-                if text == config.ENRICH_STATS_COMMAND:
-                    if not access.is_admin(sender):
-                        asyncio.create_task(
-                            ym_send_text("❌ Эта команда доступна только админам.", target=target)
-                        )
-                        continue
-                    asyncio.create_task(_handle_enrich_stats(target))
-                    continue
-
-                # /лимиты [число] — только админам
-                if text == config.DADATA_LIMIT_COMMAND or text.startswith(config.DADATA_LIMIT_COMMAND + " "):
-                    if not access.is_admin(sender):
-                        asyncio.create_task(
-                            ym_send_text("❌ Эта команда доступна только админам.", target=target)
-                        )
-                        continue
-                    asyncio.create_task(_handle_dadata_limit(text, target, skey))
-                    continue
-
-                module_context = CommandContext(
-                    chat=chat,
-                    sender=sender,
-                    target=target,
-                    text=text,
-                    display_name=display_name,
-                )
-                if text in config.prices_module_settings()["commands"]:
-                    await _dispatch_prices(module_context)
-                    continue
-
-                if text in config.epd_prices_module_settings()["commands"]:
-                    await _dispatch_epd_prices(module_context)
-                    continue
-
-                if text in config.enrich_module_settings()["commands"]:
-                    await _dispatch_enrich(module_context)
-                    continue
-
-                if file_info:
-                    request_key = _enrich_request_key(chat, sender)
-                    expires = _pending_enrich.pop(request_key, 0) if request_key else 0
-                    if target and expires >= time.monotonic() and _enrich_allowed_here(chat, sender):
-                        asyncio.create_task(
-                            _handle_enrich(
-                                sender, file_info["id"], file_info["name"],
-                                target,
-                            )
-                        )
-                    else:
-                        # файл без предварительной команды /обогатить (или от другого
-                        # человека, или после истечения ожидания) — молча игнорируем
-                        logging.info(f"[ЯМ] файл от '{display_name}' проигнорирован — не ждали от него файл")
-                    continue
-
-                if text_raw and chat.get("type") == "private" and access.has_access(sender):
-                    asyncio.create_task(
-                        ym_send_text("❓ Неизвестная команда. Подробнее: /help или /помощь", target=target)
-                    )
 
             if not updates:
                 await asyncio.sleep(1)
@@ -737,13 +759,56 @@ async def _listen_forever():
         await asyncio.sleep(10)
 
 
+async def _run_chat_jobs(kind: str) -> None:
+    while True:
+        try:
+            job = admin_store.claim_chat_job(config.ADMIN_DB_PATH, kind)
+        except sqlite3.Error:
+            logging.exception("[ЯМ] Не удалось прочитать задания %s", kind)
+            await asyncio.sleep(3)
+            continue
+        if job is None:
+            await asyncio.sleep(1)
+            continue
+        update_id, payload = job
+        ok = False
+        try:
+            sender, chat, target = payload["sender"], payload["chat"], payload["target"]
+            if kind == "enrich" and _enrich_allowed_here(chat, sender):
+                await _handle_enrich(sender, payload["file"]["id"], payload["file"]["name"], target)
+            elif kind == "prices" and _prices_allowed_here(chat, sender) and config.prices_module_settings()["enabled"]:
+                await _handle_prices(payload["display_name"], target)
+            elif kind == "epd_prices" and _prices_allowed_here(chat, sender) and config.epd_prices_module_settings()["enabled"]:
+                await _handle_epd_prices(payload["display_name"], target)
+            else:
+                await ym_send_text("⏸ Задание отменено: доступ или настройки модуля изменились.", target=target)
+            ok = True
+        except Exception:
+            logging.exception("[ЯМ] Ошибка задания %s (%s)", update_id, kind)
+        # При отмене процесса запись остаётся running и будет восстановлена на старте.
+        while True:
+            try:
+                admin_store.finish_chat_job(config.ADMIN_DB_PATH, update_id, ok)
+                break
+            except sqlite3.Error:
+                logging.exception("[ЯМ] Не удалось сохранить результат задания %s", update_id)
+                await asyncio.sleep(3)
+
+
+async def _listen_with_jobs() -> None:
+    recovered = admin_store.recover_chat_jobs(config.ADMIN_DB_PATH)
+    if recovered:
+        logging.info("[ЯМ] Восстановлено заданий: %s", recovered)
+    await asyncio.gather(_listen_forever(), *(_run_chat_jobs(kind) for kind in ("prices", "epd_prices", "enrich")))
+
+
 async def _daemon_forever():
     """
     Постоянный режим для PM2/автозагрузки: слушает чат
     И сам следит за расписанием парсера цен (раз в 7 дней).
     """
     await asyncio.gather(
-        _listen_forever(),
+        _listen_with_jobs(),
         prices.scheduler_loop(),
         epd_prices.scheduler_loop(),
         _run_admin_queue(),
@@ -825,7 +890,7 @@ if __name__ == "__main__":
 
     if args.listen:
         try:
-            asyncio.run(_listen_forever())
+            asyncio.run(_listen_with_jobs())
         except KeyboardInterrupt:
             pass
         raise SystemExit(0)

@@ -2,8 +2,10 @@
 
 import json
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -77,6 +79,27 @@ def init_db(path: Path) -> None:
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chat_jobs (
+                update_id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                finished_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS chat_jobs_ready ON chat_jobs(kind, status, update_id);
+            CREATE TABLE IF NOT EXISTS enrich_pending (
+                chat_key TEXT NOT NULL,
+                sender_key TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (chat_key, sender_key)
+            );
+            CREATE TABLE IF NOT EXISTS price_gaps (
+                source TEXT NOT NULL,
+                region_code TEXT NOT NULL,
+                tariff_key TEXT NOT NULL,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source, region_code, tariff_key)
             );
         """)
 
@@ -371,3 +394,112 @@ def list_audit(path: Path, limit: int = 100) -> list[dict]:
     with _connect(path) as conn:
         rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(row) for row in rows]
+
+
+def expect_enrich_file(path: Path, key: tuple[str, str], expires: float) -> None:
+    with _connect(path) as conn:
+        conn.execute("DELETE FROM enrich_pending WHERE expires_at <= ?", (time.time(),))
+        conn.execute("INSERT OR REPLACE INTO enrich_pending VALUES (?, ?, ?)", (*key, expires))
+
+
+def enqueue_chat_job(path: Path, update_id: int, kind: str, payload: dict,
+                     request_key: tuple[str, str] | None = None) -> bool:
+    """Файл и погашение запроса на него записываются одной транзакцией."""
+    with _connect(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM chat_jobs WHERE update_id=?", (update_id,)).fetchone():
+            return False
+        if request_key is not None:
+            deleted = conn.execute(
+                "DELETE FROM enrich_pending WHERE chat_key=? AND sender_key=? AND expires_at > ?",
+                (*request_key, time.time()),
+            )
+            if not deleted.rowcount:
+                return False
+        cursor = conn.execute(
+            "INSERT INTO chat_jobs (update_id, kind, payload) VALUES (?, ?, ?)",
+            (update_id, kind, json.dumps(payload, ensure_ascii=False)),
+        )
+        return bool(cursor.rowcount)
+
+
+def recover_chat_jobs(path: Path) -> int:
+    init_db(path)
+    with _connect(path) as conn:
+        conn.execute("DELETE FROM chat_jobs WHERE finished_at < ?", (time.time() - 7 * 86400,))
+        return conn.execute("UPDATE chat_jobs SET status='queued' WHERE status='running'").rowcount
+
+
+def claim_chat_job(path: Path, kind: str) -> tuple[int, dict] | None:
+    with _connect(path) as conn:
+        row = conn.execute("""
+            UPDATE chat_jobs SET status='running' WHERE update_id=(
+                SELECT update_id FROM chat_jobs WHERE kind=? AND status='queued'
+                ORDER BY update_id LIMIT 1
+            ) RETURNING update_id, payload
+        """, (kind,)).fetchone()
+        return (row["update_id"], json.loads(row["payload"])) if row else None
+
+
+def finish_chat_job(path: Path, update_id: int, ok: bool) -> None:
+    with _connect(path) as conn:
+        conn.execute("UPDATE chat_jobs SET status=?, payload='{}', finished_at=? WHERE update_id=?",
+                     ("done" if ok else "failed", time.time(), update_id))
+
+
+def reconcile_price_gaps(path: Path, source: str, missing: set[tuple[str, str]],
+                         observed: set[tuple[str, str]], coverage_ok: bool) -> set[tuple[str, str]]:
+    """Сохраняет пропуски для проверки и снимает подтверждение с вернувшейся цены."""
+    init_db(path)
+    with _connect(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = {(row["region_code"], row["tariff_key"]): row["confirmed"] for row in conn.execute(
+            "SELECT region_code, tariff_key, confirmed FROM price_gaps WHERE source=?", (source,),
+        )}
+        obsolete = observed & existing.keys()
+        if coverage_ok:
+            obsolete |= {key for key, confirmed in existing.items() if not confirmed and key not in missing}
+        conn.executemany("DELETE FROM price_gaps WHERE source=? AND region_code=? AND tariff_key=?",
+                         [(source, *key) for key in obsolete])
+        if coverage_ok:
+            conn.executemany("INSERT OR IGNORE INTO price_gaps(source, region_code, tariff_key) VALUES(?,?,?)",
+                             [(source, *key) for key in missing])
+        return {key for key, confirmed in existing.items() if confirmed and key not in observed}
+
+
+def list_price_gaps(path: Path) -> list[dict]:
+    init_db(path)
+    with _connect(path) as conn:
+        rows = conn.execute("""
+            SELECT source, tariff_key, COUNT(*) AS regions, GROUP_CONCAT(region_code, ', ') AS region_codes
+            FROM price_gaps WHERE confirmed=0
+            GROUP BY source, tariff_key ORDER BY source, tariff_key
+        """)
+        return [dict(row) for row in rows]
+
+
+def confirm_price_withdrawal(path: Path, source: str, tariff: str, region_codes: str, evidence: str, actor: str) -> int:
+    hosts = {"sbis": ("saby.ru", "sbis.ru"), "kontur": ("kontur.ru", "kontur-extern.ru")}
+    url = urlsplit(evidence)
+    hostname = url.hostname or ""
+    if (
+        not tariff or len(evidence) > 1000 or url.scheme != "https" or url.username or url.password
+        or not any(hostname == host or hostname.endswith(f".{host}") for host in hosts.get(source, ()))
+    ):
+        raise ValueError("Укажите HTTPS-ссылку на официальный источник выбранного поставщика.")
+    displayed = {code.strip() for code in region_codes.split(",") if code.strip()}
+    if len(displayed) > 100 or any(not code.isascii() or not code.isdecimal() or len(code) > 2 for code in displayed):
+        raise ValueError("Некорректный список регионов.")
+    init_db(path)
+    with _connect(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = {row[0] for row in conn.execute("""
+            SELECT region_code FROM price_gaps WHERE source=? AND tariff_key=? AND confirmed=0
+        """, (source, tariff))}
+        if not current or displayed != current:
+            raise ValueError("Список пропусков изменился. Сверьте текущие регионы и подтвердите заново.")
+        conn.execute("UPDATE price_gaps SET confirmed=1 WHERE source=? AND tariff_key=? AND confirmed=0", (source, tariff))
+        _audit(conn, actor, "price_withdrawal_confirmed", {
+            "source": source, "tariff": tariff, "regions": sorted(current), "evidence": evidence,
+        })
+        return len(current)

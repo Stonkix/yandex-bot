@@ -128,6 +128,10 @@ class SbisPriceListTests(unittest.TestCase):
                 self.assertEqual([ws.cell(3, i).value for i in (index, index + 1)], [5100, 8100])
                 index = next(cell.column for cell in ws[1] if cell.value == "Дополнительные направления сдачи")
                 self.assertEqual([ws.cell(3, i).value for i in (index, index + 1)], [2000, 900.5])
+                group = next(merged for merged in ws.merged_cells.ranges if merged.min_col == index)
+                self.assertEqual(ws.cell(3, group.min_col).border.left.style, "thin")
+                self.assertEqual(ws.cell(3, group.max_col).border.right.style, "thin")
+                self.assertEqual(ws.cell(3, group.min_col).border.bottom.style, "thin")
             finally:
                 wb.close()
 
@@ -230,6 +234,25 @@ ZERO_PDF_TEXT = """Тарифный план «Нулевая отчетност
 
 
 class KonturPriceListParsingTests(unittest.TestCase):
+    def test_only_group_outline_runs_through_all_region_rows(self):
+        keys = [("Учетный", "ЮЛ на ОСНО"), ("Максимальный", "ЮЛ на ОСНО"), ("Оптимальный +", "ЮЛ на ОСНО")]
+        rows = [("1", "Адыгея", {key: 100 for key in keys}), ("77", "Москва", {key: 200 for key in keys})]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "kontur.xlsx"
+            prices.save_kontur_excel(rows, keys, [], [], [], [], {}, str(path))
+            book = load_workbook(path)
+            try:
+                ws = book.active
+                self.assertIn("B1:D1", [str(group) for group in ws.merged_cells.ranges])
+                self.assertEqual(ws["C1"].border.top.style, "thin")
+                self.assertEqual(ws["B3"].border.left.style, "thin")
+                self.assertEqual(ws["D3"].border.right.style, "thin")
+                self.assertEqual(ws["D4"].border.bottom.style, "thin")
+                self.assertFalse(ws["C3"].border.left and ws["C3"].border.left.style)
+                self.assertEqual(ws["C3"].value, 100)
+            finally:
+                book.close()
+
     def test_business_forms_match_site_selector(self):
         form = prices.kontur_biz_form
         self.assertEqual(form("ЮЛ", "общая/смешанная", "Оптимальный плюс с НДС"), "ЮЛ на ОСНО")

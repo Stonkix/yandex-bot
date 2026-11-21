@@ -346,7 +346,20 @@ def create_app() -> Flask:
             "prices.html", title="Цены 1СО",
             settings=config.prices_module_settings(), schedule=status.prices_schedule(),
             last_prices=status.last_fetch("prices"), picker=_chat_picker("prices"),
+            price_gaps=admin_store.list_price_gaps(db),
         )
+
+    @app.post("/prices/withdrawals")
+    def prices_withdrawals():
+        try:
+            count = admin_store.confirm_price_withdrawal(
+                db, request.form.get("source", ""), request.form.get("tariff", ""),
+                request.form.get("region_codes", ""), request.form.get("evidence", "").strip(), session["user"],
+            )
+            flash(f"Снятие тарифа подтверждено для {count} регионов. История обновится при следующей выгрузке.", "success")
+        except ValueError as error:
+            flash(str(error), "error")
+        return redirect(url_for("prices"))
 
     @app.route("/epd-prices", methods=["GET", "POST"])
     def epd_prices_page():

@@ -63,4 +63,27 @@
     </div>
   </aside>
 </section>
+{% if price_gaps %}
+<section class="card" id="price-gaps">
+  <div class="card-head"><h2>Пропавшие тарифы</h2></div>
+  <div class="card-body stack">
+    <p class="muted">Сверьте тариф и коды регионов с официальным прайсом. Подтверждайте только снятые позиции.</p>
+    {% for gap in price_gaps %}
+      <details>
+        <summary>{{ "СБИС" if gap.source == "sbis" else "Контур" }} · {{ gap.tariff_key }} ({{ gap.regions }})</summary>
+        <form class="stack" method="post" action="{{ url_for('prices_withdrawals') }}">
+          {{ csrf_field() }}
+          <input type="hidden" name="source" value="{{ gap.source }}">
+          <input type="hidden" name="tariff" value="{{ gap.tariff_key }}">
+          <input type="hidden" name="region_codes" value="{{ gap.region_codes }}">
+          <p class="muted">Коды регионов {{ gap.region_codes }}</p>
+          <label class="field">Ссылка на официальный прайс
+            <input type="url" name="evidence" maxlength="1000" required></label>
+          <div><button class="btn">Подтвердить снятие</button></div>
+        </form>
+      </details>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
 {% endblock %}

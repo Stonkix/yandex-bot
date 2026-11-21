@@ -15,23 +15,25 @@ import sqlite3
 import shutil
 import tempfile
 import time
+from copy import copy
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Side
 from openpyxl.utils import get_column_letter
 from playwright.async_api import async_playwright
 
 from yandexbot.core import access, config
+from yandexbot.admin import store as admin_store
 from yandexbot.modules import archives
 from yandexbot.core.utils import (
     BOLD, CENTER, LEFT, RUN_KIND_AUTO, RUN_KIND_MANUAL, apply_diff_fill,
     ensure_run_kind_column, previous_run_filter, progress_text, short_error, staged_report,
 )
-from yandexbot.messenger.ym_api import ym_send_text, ym_send_file
+from yandexbot.messenger.ym_api import PRICE_DELIVERY_RETRY_DELAYS, ym_send_text, ym_send_file
 from yandexbot.core import schedule, state
 from yandexbot.core.state import prices_lock
 
@@ -1298,6 +1300,27 @@ def _ob_package_label(count: int | str) -> str:
     return f"1+{count}" if isinstance(count, int) else count
 
 
+def _outline_tariff_groups(sheet):
+    """Обводит объединённые заголовки вместе со всеми строками их группы."""
+    edge = Side(style="thin", color="000000")
+    bottom = sheet.max_row
+    for merged in sheet.merged_cells.ranges:
+        if merged.min_row != 1 or merged.max_row != 1:
+            continue
+        for row in (1, bottom):
+            for column in range(merged.min_col, merged.max_col + 1):
+                cell = sheet.cell(row, column)
+                border = copy(cell.border)
+                setattr(border, "top" if row == 1 else "bottom", edge)
+                cell.border = border
+        for row in range(1, bottom + 1):
+            for column, side in ((merged.min_col, "left"), (merged.max_col, "right")):
+                cell = sheet.cell(row, column)
+                border = copy(cell.border)
+                setattr(border, side, edge)
+                cell.border = border
+
+
 def save_sbis_excel(all_rows: list[dict], prev: dict, filepath: str):
     wb = Workbook()
     ws = wb.active
@@ -1336,6 +1359,7 @@ def save_sbis_excel(all_rows: list[dict], prev: dict, filepath: str):
     for col, label in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(col)].width = 24 if col == 2 else max(10, len(label) + 2)
 
+    _outline_tariff_groups(ws)
     wb.save(filepath)
 
 
@@ -1533,15 +1557,17 @@ def save_kontur_excel(
     for col_i in other_col_map.values():
         ws.column_dimensions[get_column_letter(col_i)].width = 16
 
+    _outline_tariff_groups(ws)
     wb.save(filepath)
 
 # ─── Формирование сообщения об изменениях ────────────────────────────────────
 
-def compare_prices(all_rows, prev: dict, key_fn, price_fn) -> dict | None:
+def compare_prices(all_rows, prev: dict, key_fn, price_fn,
+                   confirmed: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset()) -> dict | None:
     """Сравнение с прошлой выгрузкой; None — сравнивать не с чем.
 
     changed — сколько цен изменилось, missing — сколько прошлых позиций
-    нет в текущей выгрузке (неполный ответ источника или снятый тариф),
+    нет в текущей выгрузке без подтверждения снятия, withdrawn — подтверждённые снятия,
     new_tariffs — тарифы (вторая часть ключа), которых не было ни в одном
     регионе прошлой выгрузки: новые тарифы и формы бизнеса.
     """
@@ -1554,10 +1580,14 @@ def compare_prices(all_rows, prev: dict, key_fn, price_fn) -> dict | None:
         if new is not None:
             current[key_fn(row)] = new
     changed = sum(previous[key] != current[key] for key in previous.keys() & current.keys())
-    missing = len(previous.keys() - current.keys())
+    missing_keys = previous.keys() - current.keys()
+    withdrawn = missing_keys & confirmed
     prev_tariffs = {key[1] for key in previous}
     new_tariffs = sorted({key[1] for key in current} - prev_tariffs)
-    return {"changed": changed, "missing": missing, "new_tariffs": new_tariffs}
+    result = {"changed": changed, "missing": len(missing_keys - withdrawn), "new_tariffs": new_tariffs}
+    if withdrawn:
+        result["withdrawn"] = sorted({key[1] for key in withdrawn})
+    return result
 
 
 def build_diff_message(source: str, comparison: dict | None) -> str:
@@ -1569,6 +1599,13 @@ def build_diff_message(source: str, comparison: dict | None) -> str:
              else f"⚠️ {source}: часть цен не получена."]
     if missing:
         lines.append(f"⚠️ {source}: нет данных по {missing} позициям из прошлой выгрузки.")
+        lines.append("Подтвердить снятие по официальному прайсу можно в панели → Цены 1СО.")
+    withdrawn = comparison.get("withdrawn", [])
+    if withdrawn:
+        lines.append(f"➖ {source}: подтверждено снятие тарифов ({len(withdrawn)}):")
+        lines.extend(f"  • {name}" for name in withdrawn[:20])
+        if len(withdrawn) > 20:
+            lines.append(f"  … и ещё {len(withdrawn) - 20}")
     new_tariffs = comparison.get("new_tariffs") or []
     if new_tariffs:
         lines.append(f"🆕 {source}: новые тарифы/формы бизнеса ({len(new_tariffs)}):")
@@ -1611,27 +1648,31 @@ async def run_sbis(delay_sec: float = 0.3, sources_dir: Path | None = None,
         if not any(row["price"] is not None for row in db_s):
             raise RuntimeError("в каталоге не найдено ни одной цены отчётности")
         prev_s = db_get_previous(conn, "sbis", now_str, run_kind)
+        expected = {str(code).zfill(2) for code, _ in REGIONS_SBIS}
+        priced_rows = [r for r in db_s if r["price"] is not None]
+        received = {r["region_code"] for r in priced_rows}
+        active = {(r["region_code"], r["tariff_key"]) for r in priced_rows}
+        missing = ({(region, key) for region in expected for key in SBIS_NOMENCLATURES}
+                   | {key for key, value in prev_s.items() if value is not None}) - active
+        confirmed = admin_store.reconcile_price_gaps(config.ADMIN_DB_PATH, "sbis", missing, active, expected <= received)
         comparison = compare_prices(
             db_s, prev_s,
             key_fn   = lambda r: (r["region_code"].zfill(2), r["tariff_key"]),
             price_fn = lambda r: r["price"],
+            confirmed=confirmed,
         )
-        expected = {str(code).zfill(2) for code, _ in REGIONS_SBIS}
-        priced_rows = [r for r in db_s if r["price"] is not None]
-        received = {r["region_code"] for r in priced_rows}
-        full = len(priced_rows) == len(expected) * len(SBIS_NOMENCLATURES)
-        full = full and expected <= received and not (comparison and comparison["missing"])
+        full = expected <= received and missing <= confirmed
         suffix = "" if full else "_partial"
         output = config.CONFIG_DIR / f"sbis_{date_str}{suffix}.xlsx"
         with staged_report(output) as staged:
             save_sbis_excel(rows_s, prev_s, staged)
         summary = build_diff_message("СБИС", comparison)
         if full:
-            db_save_prices(conn, "sbis", db_s, now_str, run_kind)
+            db_save_prices(conn, "sbis", priced_rows, now_str, run_kind)
         else:
             summary += (
                 f"\n⚠️ СБИС: цены получены по {len(expected & received)} из {len(expected)} регионов, "
-                f"{len(priced_rows)} из {len(expected) * len(SBIS_NOMENCLATURES)} позиций. Снимок неполный."
+                f"неподтверждённых пропусков: {len(missing - confirmed)}. Снимок неполный."
             )
         return {"ok": full, "summary": summary, "file": str(output), "comparison": comparison}
     except Exception as e:
@@ -1691,10 +1732,14 @@ async def run_kontur(
         if test:
             summary = f"🧪 {label}: {total} регионов обработано (тест, без записи в БД)."
         else:
+            active = {(r["region_code"], r["tariff_key"]) for r in db_k}
+            missing = {key for key, value in prev_k.items() if value is not None} - active
+            confirmed = admin_store.reconcile_price_gaps(config.ADMIN_DB_PATH, "kontur", missing, active, full)
             comparison = compare_prices(
                 db_k, prev_k,
                 key_fn   = lambda r: (r["region_code"], r["tariff_key"]),
                 price_fn = lambda r: r["price"],
+                confirmed=confirmed,
             )
             summary = build_diff_message(label, comparison)
             if comparison and comparison["missing"]:
@@ -1845,11 +1890,11 @@ async def run(source: str, announce: bool = False, announce_text: str | None = N
     targets = recipients()
     delivery_errors = []
     for file in files:
-        delivery_errors.extend(await ym_send_file(file, target=targets) or [])
+        delivery_errors.extend(await ym_send_file(file, target=targets, retry_delays=PRICE_DELIVERY_RETRY_DELAYS) or [])
     if delivery_errors:
         summary_lines += ["", "⚠ Вложения доставлены не всем получателям. Файлы доступны в панели → Отчёты."]
     summary = "\n".join(summary_lines)
-    delivery_errors.extend(await ym_send_text(summary, target=targets) or [])
+    delivery_errors.extend(await ym_send_text(summary, target=targets, retry_delays=PRICE_DELIVERY_RETRY_DELAYS) or [])
     return {"ok": ok, "summary": summary, "files": files, "sent": not delivery_errors,
             "delivery_errors": delivery_errors}
 

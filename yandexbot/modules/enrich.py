@@ -575,31 +575,32 @@ async def dadata_lookup(session: aiohttp.ClientSession, inn: str,
 
 
 def save_dadata_excel(results: list[dict], filepath: str):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Обогащение ИНН"
+    from openpyxl.cell import WriteOnlyCell
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Обогащение ИНН")
 
     finance_years = _finance_years(results)
     phone_count = _phone_count(results)
     email_count = _email_count(results)
     headers = ["ИНН (запрос)", *_enrich_headers(finance_years, phone_count, email_count)]
-    ws.append(headers)
-    for c in range(1, len(headers) + 1):
-        ws.cell(1, c).font = BOLD
-        ws.cell(1, c).alignment = CENTER
-
-    for r in results:
-        row = [r["inn"], *_enrich_values(r, finance_years, phone_count, email_count)]
-        ws.append(row)
-        r_idx = ws.max_row
-        if not r.get("found"):
-            for c in range(1, len(headers) + 1):
-                ws.cell(r_idx, c).fill = RED
-
     wide_headers = {"Наименование", "Вид деятельности", "Доп. ОКВЭДы", "ОПФ полное", "Руководитель", "Адрес", "Учредители", "Email"}
     for i, header in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(i)].width = 36 if header in wide_headers else 16
     ws.freeze_panes = "A2"
+    labels = [WriteOnlyCell(ws, value=header) for header in headers]
+    for label in labels:
+        label.font = BOLD
+        label.alignment = CENTER
+    ws.append(labels)
+
+    for result in results:
+        row = [result["inn"], *_enrich_values(result, finance_years, phone_count, email_count)]
+        if not result.get("found"):
+            row = [WriteOnlyCell(ws, value=value) for value in row]
+            for cell in row:
+                cell.fill = RED
+        ws.append(row)
     wb.save(filepath)
 
 
@@ -610,3 +611,68 @@ def save_remaining_inns(inns: list[str], filepath: Path) -> None:
     for inn in inns:
         ws.append([inn])
     wb.save(filepath)
+
+
+def split_enrichment_report(report: Path, target_dir: Path, max_bytes: int) -> list[Path]:
+    """Делит активный лист по строкам и проверяет размер каждого готового XLSX."""
+    from openpyxl import load_workbook
+    from openpyxl.cell import WriteOnlyCell
+
+    workbook = load_workbook(report, read_only=True)
+    try:
+        source = workbook.active
+        if source.max_row is None:
+            source.calculate_dimension(force=True)
+        last_row = source.max_row or 1
+        if last_row < 2 or max_bytes < 4000:
+            raise ValueError("Таблицу нельзя разделить на допустимые вложения")
+        header, = source.iter_rows(min_row=1, max_row=1, values_only=True)
+        part_count = max(2, (report.stat().st_size + max_bytes - 1) // max_bytes)
+        rows_per_part = max(1, (last_row - 1 + part_count - 1) // part_count)
+        parts: list[Path] = []
+
+        def write_window(start: int, end: int) -> None:
+            path = target_dir / f"part-{len(parts) + 1}.xlsx"
+            part = Workbook(write_only=True)
+            sheet = part.create_sheet(source.title)
+            sheet.freeze_panes = "A2"
+            labels = []
+            for value in header:
+                label = WriteOnlyCell(sheet, value=value)
+                label.font = BOLD
+                labels.append(label)
+            sheet.append(labels)
+            for row in source.iter_rows(min_row=start, max_row=end):
+                values = []
+                for cell in row:
+                    value = WriteOnlyCell(sheet, value=cell.value)
+                    if cell.value is not None:
+                        value.number_format = cell.number_format
+                        # В автономной части ссылки на отсутствующие листы/строки теряют смысл.
+                        if cell.data_type in {"f", "s"}:
+                            value.data_type = "s"
+                        elif cell.data_type == "e":
+                            value.data_type = "e"
+                    values.append(value)
+                sheet.append(values)
+            part.save(path)
+            if path.stat().st_size <= max_bytes:
+                parts.append(path)
+            elif start == end:
+                raise ValueError(f"Строка {start} превышает лимит вложения")
+            else:
+                middle = (start + end) // 2
+                write_window(start, middle)
+                write_window(middle + 1, end)
+
+        for start in range(2, last_row + 1, rows_per_part):
+            write_window(start, min(start + rows_per_part - 1, last_row))
+    finally:
+        workbook.close()
+
+    named = []
+    for index, path in enumerate(parts, 1):
+        destination = target_dir / f"{report.stem}_часть_{index:02}_из_{len(parts):02}.xlsx"
+        path.replace(destination)
+        named.append(destination)
+    return named

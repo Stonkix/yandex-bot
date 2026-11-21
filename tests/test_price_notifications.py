@@ -12,6 +12,7 @@ from yandexbot import bot
 from yandexbot.admin import store as admin_store
 from yandexbot.core import config
 from yandexbot.core.utils import RUN_KIND_AUTO, RUN_KIND_MANUAL
+from yandexbot.messenger import ym_api
 from yandexbot.modules import epd_prices, prices
 
 CHATS = [{"chat_id": "0/0/general", "title": "Ботики", "broadcast": True, "commands": True}]
@@ -94,6 +95,68 @@ class PricesOnlyChangesTests(NotificationTestCase):
                 patch.object(prices, "ym_send_file", new=AsyncMock()):
             asyncio.run(prices.run("both", force=True, announce=manual))
         return sent
+
+    def test_confirmed_removal_preserves_new_sbis_baseline_and_other_prices(self):
+        regions = [(77, "Москва")]
+        tariffs = {"Остался": "current", "Снят": "retired"}
+        records = [
+            {"region_code": "77", "region_name": "Москва", "tariff_key": "Остался", "price": 150},
+            {"region_code": "77", "region_name": "Москва", "tariff_key": "Снят", "price": None},
+        ]
+        previous = [{**row, "price": 100} for row in records]
+        with closing(prices.db_connect()) as conn:
+            prices.db_save_prices(conn, "sbis", previous, "2020-01-01T00:00:00")
+
+        with (
+            patch.object(prices, "REGIONS_SBIS", regions),
+            patch.object(prices, "SBIS_NOMENCLATURES", tariffs),
+            patch.object(prices, "parse_sbis", new=AsyncMock(return_value=([], records))),
+        ):
+            provisional = asyncio.run(prices.run_sbis())
+            self.assertFalse(provisional["ok"])
+            with self.assertRaises(ValueError):
+                admin_store.confirm_price_withdrawal(config.ADMIN_DB_PATH, "sbis", "Снят", "77", "https://example.com", "test")
+            admin_store.confirm_price_withdrawal(config.ADMIN_DB_PATH, "sbis", "Снят", "77", "https://saby.ru/tariffs", "test")
+            confirmed = asyncio.run(prices.run_sbis())
+            self.assertTrue(confirmed["ok"])
+            self.assertEqual(confirmed["comparison"]["withdrawn"], ["Снят"])
+            self.assertEqual(confirmed["comparison"]["changed"], 1)
+            self.assertTrue(asyncio.run(prices.run_sbis())["ok"])
+            with closing(prices.db_connect()) as conn:
+                self.assertEqual(prices.db_get_previous(conn, "sbis", "3000"), {("77", "Остался"): 150})
+            records[1]["price"] = 250
+            self.assertTrue(asyncio.run(prices.run_sbis())["ok"])
+            records[1]["price"] = None
+            self.assertFalse(asyncio.run(prices.run_sbis())["ok"])
+
+    def test_failed_price_delivery_is_retried_only_for_failed_chat(self):
+        targets = [{"chat_id": "a"}, {"chat_id": "b"}, {"chat_id": "c"}]
+        file = self.dir / "prices.xlsx"
+        file.write_bytes(b"attachment")
+
+        for send_file in (True, False):
+            contacts = []
+
+            async def post(_session, _url, **kwargs):
+                if send_file:
+                    fields = kwargs["data"]._fields
+                    target = next(value for options, _, value in fields if options["name"] == "chat_id")
+                else:
+                    target = kwargs["json"]["chat_id"]
+                contacts.append(target)
+                if target == "b" and contacts.count("b") == 1:
+                    return "HTTP 503", True, 0
+                if target == "c":
+                    return "HTTP 403", False, 0
+                return "", False, 0
+
+            with patch.object(ym_api, "_post_delivery", side_effect=post):
+                if send_file:
+                    errors = asyncio.run(ym_api.ym_send_file(str(file), target=targets, retry_delays=(0, 0)))
+                else:
+                    errors = asyncio.run(ym_api.ym_send_text("Итог", target=targets, retry_delays=(0, 0)))
+            self.assertEqual(contacts, ["a", "b", "b", "c"])
+            self.assertEqual(errors, ["HTTP 403"])
 
     def test_scheduled_run_without_changes_is_silent(self):
         same = {"changed": 0, "missing": 0}

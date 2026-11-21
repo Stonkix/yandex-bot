@@ -4,6 +4,7 @@
 Документация: https://yandex.ru/dev/messenger/doc/ru/
 """
 
+import asyncio
 import logging
 import os
 
@@ -15,6 +16,7 @@ from yandexbot.core import config
 YM_API_BASE = "https://botapi.messenger.yandex.net/bot/v1"
 YM_MAX_LEN  = 4000  # с запасом от лимита API на длину текста
 YM_MAX_FILE_BYTES = 51_000_000  # 51 МБ на вложение по данным Яндекс 360
+PRICE_DELIVERY_RETRY_DELAYS = (2, 8)
 
 
 def _resolve_targets(target: dict | list[dict] | None) -> list[dict]:
@@ -37,8 +39,40 @@ def _resolve_targets(target: dict | list[dict] | None) -> list[dict]:
     return access.broadcast_targets()
 
 
+async def _post_delivery(session, url: str, **kwargs) -> tuple[str, bool, int]:
+    try:
+        async with session.post(url, **kwargs) as response:
+            try:
+                data = await response.json(content_type=None)
+            except ValueError:
+                data = None
+            status = response.status
+            if 200 <= status < 300 and isinstance(data, dict) and data.get("ok"):
+                return "", False, 0
+            description = data.get("description") if isinstance(data, dict) else None
+            response_code = data.get("error_code") if isinstance(data, dict) else None
+            if status < 400 and isinstance(response_code, int):
+                status = response_code
+            reason = f"HTTP {status}" + (f" — {description}" if description else "")
+            retry_after = response.headers.get("Retry-After", "")
+            delay = min(int(retry_after), 30) if retry_after.isascii() and retry_after.isdecimal() else 0
+            retryable = status == 429 or 500 <= status < 600
+            return reason, retryable, delay
+    except (aiohttp.ClientError, TimeoutError) as error:
+        return type(error).__name__, True, 0
+
+
+async def _retry_delivery(send, delays: tuple[int, ...]) -> str:
+    for pause in (*delays, None):
+        reason, retryable, retry_after = await send()
+        if not retryable or pause is None:
+            return reason
+        await asyncio.sleep(max(pause, retry_after))
+    return reason
+
+
 async def ym_send_text(text: str, target: dict | list[dict] | None = None,
-                       suggest_buttons: dict | None = None) -> list[str]:
+                       suggest_buttons: dict | None = None, *, retry_delays: tuple[int, ...] = ()) -> list[str]:
     """
     target=None -> уходит всем broadcast-чатам (рассылка цен и т.п.).
     target={"chat_id"|"login": ...} -> ответ конкретно туда, откуда пришла команда.
@@ -75,24 +109,14 @@ async def ym_send_text(text: str, target: dict | list[dict] | None = None,
                 payload = {**tgt, "text": part}
                 if suggest_buttons and part == chunks[-1]:
                     payload["suggest_buttons"] = suggest_buttons
-                try:
-                    async with session.post(url, json=payload, headers=headers,
-                                            timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        try:
-                            data = await resp.json(content_type=None)
-                        except ValueError:
-                            data = None
-                        if 200 <= resp.status < 300 and isinstance(data, dict) and data.get("ok"):
-                            continue
-                        description = data.get("description") if isinstance(data, dict) else None
-                        error = f"HTTP {resp.status}"
-                        if description:
-                            error += f" — {description}"
-                        logging.error("[ЯМ] Ошибка отправки текста в %s: %s", tgt, error)
-                        errors.append(error)
-                except Exception as e:
-                    logging.error(f"[ЯМ] Ошибка отправки текста в {tgt}: {e}")
-                    errors.append(type(e).__name__)
+                async def send():
+                    return await _post_delivery(session, url, json=payload, headers=headers,
+                                                timeout=aiohttp.ClientTimeout(total=30))
+
+                error = await _retry_delivery(send, retry_delays)
+                if error:
+                    logging.error("[ЯМ] Ошибка отправки текста в %s: %s", tgt, error)
+                    errors.append(error)
     return errors
 
 
@@ -102,7 +126,7 @@ def _upload_timeout(size_bytes: int) -> aiohttp.ClientTimeout:
 
 
 async def ym_send_file(filepath: str, caption: str | None = None,
-                       target: dict | list[dict] | None = None) -> list[str]:
+                       target: dict | list[dict] | None = None, *, retry_delays: tuple[int, ...] = ()) -> list[str]:
     """Отправляет файл; возвращает список ошибок по получателям (пустой — всё дошло)."""
     headers = {"Authorization": f"OAuth {config.YANDEX_TOKEN}"}
     url = f"{YM_API_BASE}/messages/sendFile/"
@@ -118,32 +142,26 @@ async def ym_send_file(filepath: str, caption: str | None = None,
 
     async with aiohttp.ClientSession() as session:
         for tgt in targets:
-            form = aiohttp.FormData()
-            for k, v in tgt.items():
-                form.add_field(k, v)
-            if caption:
-                form.add_field("text", caption)
-            try:
+            async def send():
+                form = aiohttp.FormData()
+                for key, value in tgt.items():
+                    form.add_field(key, value)
+                if caption:
+                    form.add_field("text", caption)
                 with open(filepath, "rb") as document:
                     form.add_field("document", document, filename=filename,
                                    content_type="application/octet-stream")
-                    async with session.post(url, data=form, headers=headers,
-                                            timeout=_upload_timeout(size_bytes)) as resp:
-                        try:
-                            data = await resp.json(content_type=None)
-                        except ValueError:
-                            data = None
-                        if 200 <= resp.status < 300 and isinstance(data, dict) and data.get("ok"):
-                            continue
-                        description = data.get("description") if isinstance(data, dict) else None
-                        reason = f"HTTP {resp.status}"
-                        if description:
-                            reason += f" — {description}"
-            except Exception as e:
-                reason = f"{type(e).__name__}: {e}".rstrip(": ")
-            logging.error("[ЯМ] Ошибка отправки файла %s (%d КБ) в %s: %s",
-                          filename, size_bytes // 1024, tgt, reason)
-            errors.append(reason)
+                    return await _post_delivery(session, url, data=form, headers=headers,
+                                                timeout=_upload_timeout(size_bytes))
+
+            try:
+                reason = await _retry_delivery(send, retry_delays)
+            except OSError as error:
+                reason = f"{type(error).__name__}: {error}"
+            if reason:
+                logging.error("[ЯМ] Ошибка отправки файла %s (%d КБ) в %s: %s",
+                              filename, size_bytes // 1024, tgt, reason)
+                errors.append(reason)
     return errors
 
 

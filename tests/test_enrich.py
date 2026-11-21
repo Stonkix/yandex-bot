@@ -1,5 +1,8 @@
 import asyncio
+import random
+import string
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -8,6 +11,7 @@ from openpyxl import Workbook, load_workbook
 
 from yandexbot import bot
 from yandexbot.admin import status
+from yandexbot.admin import store
 from yandexbot.modules import enrich
 
 
@@ -122,6 +126,78 @@ class EnrichStatsTest(unittest.TestCase):
 
 
 class EnrichDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_large_workbook_is_sent_as_complete_numbered_excel_parts(self):
+        rows = [("7707083893", "".join(random.Random(i).choices(string.ascii_letters, k=1000)))
+                for i in range(1, 36)]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "enrich_example.xlsx"
+            original = Workbook(write_only=True)
+            sheet = original.create_sheet("Результат")
+            sheet.append(["ИНН", "Результат"])
+            for row in rows:
+                sheet.append(row)
+            original.create_sheet("Приложение")
+            original.save(output)
+            with (
+                patch.object(bot, "YM_MAX_FILE_BYTES", 8800),
+                patch.object(bot, "ym_send_file", new=AsyncMock(return_value=[])) as send,
+            ):
+                note = await bot._send_enrichment_report(output, "Итог", {"chat_id": "chat-A"})
+            self.assertIn("отправлен частями", note)
+            self.assertGreater(send.await_count, 1)
+            reconstructed = []
+            for i, call in enumerate(send.await_args_list, 1):
+                attachment = Path(call.args[0])
+                self.assertLessEqual(attachment.stat().st_size, 8800)
+                self.assertIn(f"Часть {i} из {send.await_count}", call.kwargs["caption"])
+                self.assertEqual(call.kwargs["target"], {"chat_id": "chat-A"})
+                report = load_workbook(attachment, read_only=True)
+                try:
+                    header, *values = list(report.active.values)
+                    self.assertEqual(header, ("ИНН", "Результат"))
+                    reconstructed.extend(values)
+                finally:
+                    report.close()
+            self.assertEqual(reconstructed, rows)
+            self.assertTrue(output.exists())
+
+    async def test_poller_saves_job_before_advancing_offset(self):
+        updates = [
+            {"update_id": 10, "chat": {"id": "chat-A", "type": "group"}, "from": {"login": "a"}, "text": "/обогатить"},
+            {"update_id": 11, "chat": {"id": "chat-A", "type": "group"}, "from": {"login": "a"},
+             "file": {"id": "file-id", "name": "inn.xlsx"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "admin.db"
+            store.init_db(db)
+
+            def save_offset(offset):
+                if offset == 12:
+                    update_id, payload = store.claim_chat_job(db, "enrich")
+                    self.assertEqual(update_id, 11)
+                    self.assertEqual(payload["file"]["id"], "file-id")
+
+            with (
+                patch.object(bot.config, "ADMIN_DB_PATH", db),
+                patch.object(bot.config, "enrich_module_settings",
+                             return_value={"enabled": True, "commands": ["/обогатить"]}),
+                patch.object(bot, "_enrich_allowed_here", return_value=True),
+                patch.object(bot, "_load_offset", return_value=None),
+                patch.object(bot, "_save_offset", side_effect=save_offset),
+                patch.object(bot, "ym_send_text", new=AsyncMock()),
+                patch.object(bot, "ym_get_updates", new=AsyncMock(side_effect=[
+                    {"ok": True, "updates": updates}, asyncio.CancelledError(),
+                ])),
+                patch("builtins.print"),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await bot.listen_commands()
+            self.assertEqual(store.recover_chat_jobs(db), 1)
+            self.assertEqual(store.claim_chat_job(db, "enrich")[0], 11)
+            store.expect_enrich_file(db, ("chat-A", "a"), time.time() + 10)
+            self.assertFalse(store.enqueue_chat_job(db, 11, "enrich", {}, ("chat-A", "a")))
+            self.assertTrue(store.enqueue_chat_job(db, 12, "enrich", {"new": True}, ("chat-A", "a")))
+
     async def test_dadata_retry_uses_quota_and_keeps_http_error(self):
         response = AsyncMock()
         response.__aenter__.return_value = response

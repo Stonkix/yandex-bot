@@ -315,6 +315,21 @@ class AccessTests(PanelTestCase):
 
 
 class RunsAndReportsTests(PanelTestCase):
+    def test_confirm_withdrawal_is_available_for_missing_tariff_in_prices_page(self):
+        self.login()
+        admin_store.reconcile_price_gaps(self.db, "kontur", {("77", "Старый тариф")}, set(), True)
+        page = self.client.get("/prices").get_data(as_text=True)
+        self.assertIn("Старый тариф", page)
+        self.post("/prices/withdrawals", {
+            "source": "kontur", "tariff": "Старый тариф", "region_codes": "77",
+            "evidence": "https://www.kontur-extern.ru/price-download/77",
+        }, page="/prices")
+        self.assertEqual(admin_store.list_price_gaps(self.db), [])
+        self.assertEqual(
+            admin_store.reconcile_price_gaps(self.db, "kontur", {("77", "Старый тариф")}, set(), True),
+            {("77", "Старый тариф")},
+        )
+
     def test_enqueue_and_cancel_run(self):
         self.login()
         self.post("/runs", {"job": "epd_prices:full", "delivery": "admin"})

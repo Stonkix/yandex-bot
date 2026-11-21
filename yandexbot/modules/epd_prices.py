@@ -43,7 +43,7 @@ from yandexbot.core.utils import (
     RUN_KIND_AUTO, RUN_KIND_MANUAL, ensure_run_kind_column, previous_run_filter, short_error, staged_report,
 )
 from yandexbot.modules import archives
-from yandexbot.messenger.ym_api import ym_send_file, ym_send_text
+from yandexbot.messenger.ym_api import PRICE_DELIVERY_RETRY_DELAYS, ym_send_file, ym_send_text
 
 SBIS_URL = "https://saby.ru/tariffs?tab=mobile_workers"
 SBIS_API_URL = "https://saby.ru/service/?x_version=26.2205-39"
@@ -1014,7 +1014,7 @@ async def run(target: dict | list[dict] | None = None, announce_text: str | None
         if not collected["results"]:
             retry = "Повтор по расписанию — не раньше чем через час." if scheduled else footer
             message = build_summary(collected) + (f"\n\n{retry}" if retry else "")
-            errors = list(await ym_send_text(message, target=recipients()) or [])
+            errors = list(await ym_send_text(message, target=recipients(), retry_delays=PRICE_DELIVERY_RETRY_DELAYS) or [])
             return {"ok": False, "summary": message, "file": None, "sent": not errors, "delivery_errors": errors}
 
         now = datetime.datetime.now()
@@ -1045,10 +1045,10 @@ async def run(target: dict | list[dict] | None = None, announce_text: str | None
             logging.info("[ЭПД] %s", note)
         return {"ok": ok, "summary": message, "file": str(output), "sent": False, "delivery_errors": []}
     targets = recipients()
-    errors = list(await ym_send_file(str(output), target=targets) or [])
+    errors = list(await ym_send_file(str(output), target=targets, retry_delays=PRICE_DELIVERY_RETRY_DELAYS) or [])
     if errors:
         message += "\n\n⚠ Вложение доставлено не всем получателям. Файл доступен в панели → Отчёты."
-    errors.extend(await ym_send_text(message, target=targets) or [])
+    errors.extend(await ym_send_text(message, target=targets, retry_delays=PRICE_DELIVERY_RETRY_DELAYS) or [])
     return {"ok": ok, "summary": message, "file": str(output), "sent": not errors, "delivery_errors": errors}
 
 
