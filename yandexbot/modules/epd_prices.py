@@ -40,7 +40,7 @@ from openpyxl.utils import get_column_letter
 from yandexbot.core import access, config, schedule, state
 from yandexbot.core.state import epd_prices_lock
 from yandexbot.core.utils import (
-    RUN_KIND_AUTO, RUN_KIND_MANUAL, ensure_run_kind_column, previous_run_filter, short_error,
+    RUN_KIND_AUTO, RUN_KIND_MANUAL, ensure_run_kind_column, previous_run_filter, short_error, staged_report,
 )
 from yandexbot.modules import archives
 from yandexbot.messenger.ym_api import ym_send_file, ym_send_text
@@ -669,6 +669,8 @@ async def fetch_kontur(session: aiohttp.ClientSession,
     notes.extend(merge_notes)
     if not packages:
         raise RuntimeError("пакеты ЭПД не найдены ни в PDF, ни на странице цен")
+    if pdf_packages and not addons:
+        notes.append("в PDF не найдены дополнения")
     return packages + addons, notes
 
 
@@ -699,6 +701,7 @@ async def collect(sources: tuple[str, ...] = ("epd_sbis", "epd_kontur"),
     """
     results: dict[str, list[dict]] = {}
     errors: dict[str, str] = {}
+    incomplete: set[str] = set()
     notes: list[str] = []
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
@@ -708,11 +711,15 @@ async def collect(sources: tuple[str, ...] = ("epd_sbis", "epd_kontur"),
             try:
                 rows, source_notes = await _FETCHERS[source](session, sources_dir)
                 results[source] = rows
+                if any(note.startswith(("не найдены дополнения", "на резервной странице нет цен",
+                                        "PDF прайс-лист не обработан", "в PDF не найдены дополнения"))
+                       for note in source_notes):
+                    incomplete.add(source)
                 notes.extend(f"{label}: {note}" for note in source_notes)
             except Exception as error:
                 logging.error("Ошибка выгрузки ЭПД %s: %s", label, error, exc_info=True)
                 errors[label] = short_error(error)
-    return {"results": results, "errors": errors, "notes": notes}
+    return {"results": results, "errors": errors, "notes": notes, "incomplete": incomplete}
 
 
 def previous_prices(results: dict[str, list[dict]], fetched_at: str, save: bool,
@@ -816,7 +823,7 @@ def has_news(collected: dict, previous: dict[str, dict]) -> bool:
     False — все поставщики выгружены и совпадают с прошлой выгрузкой
     (для режима «Отправлять только при изменении цен»).
     """
-    if collected["errors"] or not collected["results"]:
+    if collected["errors"] or collected.get("incomplete") or not collected["results"]:
         return True
     for source, rows in collected["results"].items():
         source_previous = previous.get(source) or {}
@@ -866,8 +873,8 @@ def build_summary(collected: dict, previous: dict[str, dict] | None = None) -> s
     else:
         title = "📦 ЭПД-цены — первая выгрузка"
     lines = [title]
-    if errors:
-        lines.append("⚠️ Выгрузка частичная: не все поставщики обработаны.")
+    if errors or collected.get("incomplete"):
+        lines.append("⚠️ Выгрузка частичная: у одного или нескольких поставщиков данные неполные.")
     for block in blocks:
         lines += ["", *block]
     if errors or collected["notes"]:
@@ -875,6 +882,30 @@ def build_summary(collected: dict, previous: dict[str, dict] | None = None) -> s
     lines.extend(f"❌ {label}: {error}" for label, error in errors.items())
     lines.extend(f"ℹ️ {note}" for note in collected["notes"])
     return "\n".join(lines)
+
+
+def _complete_sources(collected: dict, previous: dict) -> dict:
+    incomplete = set(collected.get("incomplete", ()))
+    notes = collected["notes"]
+    for source, label in SOURCES:
+        rows, prior = collected["results"].get(source), previous.get(source, {})
+        if rows and prior and {_row_key(row) for row in rows} & prior.keys():
+            removed = len(price_changes(rows, prior)["removed"])
+            if removed > max(3, len(prior) // 2):
+                incomplete.add(source)
+                notes.append(f"{label}: получена только часть прежних позиций. Снимок не заменяет историю.")
+    collected["incomplete"] = incomplete
+    return {code: rows for code, rows in collected["results"].items() if code not in incomplete}
+
+
+def _store_complete_sources(results: dict, now: str, run_kind: str) -> None:
+    if results:
+        conn = db_connect()
+        try:
+            for source, rows in results.items():
+                db_save(conn, source, rows, now, run_kind)
+        finally:
+            conn.close()
 
 
 # ─── Excel ────────────────────────────────────────────────────────────────────
@@ -981,25 +1012,30 @@ async def run(target: dict | list[dict] | None = None, announce_text: str | None
     try:
         collected = await collect(sources_dir=sources_dir)
         if not collected["results"]:
-            message = build_summary(collected) + (f"\n\n{footer}" if footer else "")
-            await ym_send_text(message, target=recipients())
-            return {"ok": False, "summary": message, "file": None}
+            retry = "Повтор по расписанию — не раньше чем через час." if scheduled else footer
+            message = build_summary(collected) + (f"\n\n{retry}" if retry else "")
+            errors = list(await ym_send_text(message, target=recipients()) or [])
+            return {"ok": False, "summary": message, "file": None, "sent": not errors, "delivery_errors": errors}
 
         now = datetime.datetime.now()
-        previous = previous_prices(
-            collected["results"], now.isoformat(timespec="seconds"), save=True,
-            run_kind=RUN_KIND_AUTO if scheduled else RUN_KIND_MANUAL,
-        )
-        output = config.CONFIG_DIR / f"epd_prices_{now:%d.%m.%y}.xlsx"
-        save_excel(collected["results"], previous, str(output))
+        fetched_at = now.isoformat(timespec="microseconds")
+        run_kind = RUN_KIND_AUTO if scheduled else RUN_KIND_MANUAL
+        previous = previous_prices(collected["results"], fetched_at, save=False, run_kind=run_kind)
+        complete = _complete_sources(collected, previous)
+        ok = not collected["errors"] and not collected["incomplete"]
+        suffix = "" if ok else "_partial"
+        output = config.CONFIG_DIR / f"epd_prices_{now:%d.%m.%y}{suffix}.xlsx"
+        with staged_report(output) as staged:
+            save_excel(collected["results"], previous, staged)
+        _store_complete_sources(complete, fetched_at, run_kind)
         archive = None
-        if sources_dir is not None and not collected["errors"] and all(
-            collected["results"].get(source) for source, _ in SOURCES
-        ):
+        if sources_dir is not None and ok and all(complete.get(source) for source, _ in SOURCES):
             archive = pack_archive(sources_dir, output, started)
     finally:
         if sources_dir is not None:
             shutil.rmtree(sources_dir, ignore_errors=True)
+    if scheduled and not ok:
+        footer = "При неполной выгрузке повтор — не раньше чем через час."
     message = (build_summary(collected, previous)
                + (f"\n\n🗄 Архив: {archive.name}" if archive else "")
                + (f"\n\n{footer}" if footer else ""))
@@ -1007,10 +1043,13 @@ async def run(target: dict | list[dict] | None = None, announce_text: str | None
         logging.info("[ЭПД] цены без изменений — итог в чаты не отправляется")
         for note in collected["notes"]:
             logging.info("[ЭПД] %s", note)
-        return {"ok": True, "summary": message, "file": str(output), "sent": False}
-    await ym_send_text(message, target=recipients())
-    await ym_send_file(str(output), target=recipients())
-    return {"ok": not collected["errors"], "summary": message, "file": str(output), "sent": True}
+        return {"ok": ok, "summary": message, "file": str(output), "sent": False, "delivery_errors": []}
+    targets = recipients()
+    errors = list(await ym_send_file(str(output), target=targets) or [])
+    if errors:
+        message += "\n\n⚠ Вложение доставлено не всем получателям. Файл доступен в панели → Отчёты."
+    errors.extend(await ym_send_text(message, target=targets) or [])
+    return {"ok": ok, "summary": message, "file": str(output), "sent": not errors, "delivery_errors": errors}
 
 
 # ─── Плановый запуск (для main.py / --daemon) ─────────────────────────────────
@@ -1025,21 +1064,19 @@ async def scheduler_tick(now: datetime.datetime | None = None) -> bool:
     auto = settings["auto"]
     if not settings["enabled"] or not auto["enabled"]:
         return False
-    if not schedule.is_due(auto["interval_days"], auto["at"], load_last_auto_run(), now):
+    current = now or datetime.datetime.now()
+    if not schedule.should_run(config.EPD_STATE_FILE, auto["interval_days"], auto["at"], current):
         return False
     if epd_prices_lock.locked():
         return False  # идёт выгрузка по команде — попробуем на следующей проверке
     async with epd_prices_lock:
-        started = datetime.datetime.now()
-        upcoming = schedule.next_run(auto["interval_days"], auto["at"], started)
+        schedule.save_attempt(config.EPD_STATE_FILE, current)
+        upcoming = schedule.next_run(auto["interval_days"], auto["at"], current)
         logging.info("Плановая выгрузка цен ЭПД")
-        try:
-            await run(footer=f"🗓 Следующая автоматическая выгрузка ЭПД: {upcoming:%d.%m.%y} в {auto['at']}",
-                      only_changes=auto["only_changes"], scheduled=True)
-        finally:
-            # Отмечаем даже при ошибке, иначе при сбое выгрузка повторялась бы
-            # на каждой проверке и засыпала чаты сообщениями.
-            schedule.save_last_run(config.EPD_STATE_FILE, started)
+        result = await run(footer=f"🗓 Следующая автоматическая выгрузка ЭПД: {upcoming:%d.%m.%y} в {auto['at']}",
+                           only_changes=auto["only_changes"], scheduled=True)
+        if result["ok"]:
+            schedule.save_last_run(config.EPD_STATE_FILE, current)
     return True
 
 
@@ -1109,24 +1146,25 @@ async def _cli_run(args, sources: tuple[str, ...], sources_dir: Path | None,
         print("\n" + build_summary(collected), flush=True)
         return 1
 
-    previous = previous_prices(
-        collected["results"], started.isoformat(timespec="seconds"), save=args.save_db,
-    )
+    fetched_at = started.isoformat(timespec="microseconds")
+    previous = previous_prices(collected["results"], fetched_at, save=False)
+    complete = _complete_sources(collected, previous)
     print("\n" + build_summary(collected, previous), flush=True)
-    if args.save_db:
-        print(f"[SQLite] история записана в {config.DB_PATH}", flush=True)
     if not args.no_excel:
         output = Path(args.out) if args.out else config.CONFIG_DIR / f"epd_prices_test_{started:%Y%m%d_%H%M%S}.xlsx"
-        save_excel(collected["results"], previous, str(output))
+        with staged_report(output) as staged:
+            save_excel(collected["results"], previous, staged)
         print(f"[Excel] {output.resolve()}", flush=True)
     else:
         output = None
-    if sources_dir is not None and output is not None and not collected["errors"] and all(
-        collected["results"].get(source) for source, _ in SOURCES
-    ):
+    if args.save_db and complete:
+        _store_complete_sources(complete, fetched_at, RUN_KIND_MANUAL)
+        print(f"[SQLite] история записана в {config.DB_PATH}", flush=True)
+    ok = not collected["errors"] and not collected["incomplete"]
+    if sources_dir is not None and output is not None and ok and all(complete.get(source) for source, _ in SOURCES):
         if archive := pack_archive(sources_dir, output, started):
             print(f"[Архив] {archive.resolve()}", flush=True)
-    return 2 if collected["errors"] else 0
+    return 0 if ok else 2
 
 
 if __name__ == "__main__":

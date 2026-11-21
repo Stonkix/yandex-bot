@@ -56,7 +56,7 @@ from yandexbot.core.module_registry import BotModule, CommandContext, CommandSpe
 from yandexbot.core import state
 from yandexbot.core.state import prices_lock, epd_prices_lock, enrich_lock
 from yandexbot.messenger.ym_api import YM_MAX_FILE_BYTES, ym_send_text, ym_send_file, ym_get_updates, ym_download_file
-from yandexbot.core.utils import short_error
+from yandexbot.core.utils import short_error, staged_report
 
 # ─── Ожидание файла после /обогатить ──────────────────────────────────────────
 # В Яндекс Мессенджере текст команды и прикреплённый файл часто приходят
@@ -65,12 +65,22 @@ from yandexbot.core.utils import short_error
 #    и запоминает, от кого именно ждёт файл;
 # 2) следующий файл именно от этого отправителя берём в работу; файлы
 #    от других людей, пока идёт ожидание, игнорируем.
-_pending_enrich: dict[str, dict] = {}  # sender_key -> {"display_name": str, "expires": float}
+_pending_enrich: dict[tuple[str, str], float] = {}
 COMMAND_MODULES = ModuleRegistry()
 
 
 def _sender_key(sender: dict) -> str:
     return sender.get("login") or sender.get("id") or "unknown"
+
+
+def _enrich_request_key(chat: dict, sender: dict) -> tuple[str, str] | None:
+    sender_id = sender.get("login") or sender.get("id")
+    if not sender_id:
+        return None
+    chat_id = chat.get("id")
+    if chat.get("type") == "private":
+        return (f"private:{chat_id or sender_id}", str(sender_id))
+    return (str(chat_id), str(sender_id)) if chat_id else None
 
 
 # ─── Адресация ответов: в приватных чатах chat.id не осмысленный, отвечаем по login ─
@@ -225,11 +235,17 @@ async def _run_admin_job(job: dict) -> tuple[str, str]:
             result = await epd_prices.run(
                 target=target, announce_text="🔄 Запуск из админ-панели: выгрузка цен ЭПД…",
             )
-        return ("success" if result["file"] else "failed"), result["summary"]
-    source = "kontur-test" if job["kind"] == "test" else "both"
-    async with prices_lock:
-        await prices.run(source, announce=True, force=True, target=target, profile="manual")
-    return "success", "Выгрузка завершена, итог отправлен в мессенджер"
+        files = [result["file"]] if result["file"] else []
+    else:
+        async with prices_lock:
+            result = await prices.run("both", announce=True, force=True, target=target, profile="manual")
+        files = result["files"]
+    collection = "успешно" if result["ok"] else "частично" if files else "ошибка"
+    delivered = "подтверждена" if result.get("sent") else "с ошибками"
+    if result.get("delivery_errors"):
+        delivered += " · " + ", ".join(dict.fromkeys(result["delivery_errors"]))[:180]
+    summary = f"Сбор цен — {collection}. Доставка — {delivered}.\n{result['summary']}"
+    return ("success" if result["ok"] and result.get("sent") else "failed"), summary
 
 
 async def _run_admin_queue():
@@ -255,13 +271,11 @@ async def _run_admin_queue():
 
 def _save_enrichment_report(source: str, output: Path, results: list[dict]) -> None:
     # Панель должна видеть только полностью записанные файлы.
-    with tempfile.TemporaryDirectory(prefix="enrich_", dir=output.parent) as work_dir:
-        staged = str(Path(work_dir) / output.name)
+    with staged_report(output) as staged:
         if Path(source).suffix.lower() == ".txt":
             enrich.save_dadata_excel(results, staged)
         else:
             enrich.save_enriched_source_excel(source, staged, results)
-        os.replace(staged, output)
 
 
 async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dict | None):
@@ -328,6 +342,7 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
             started_at = time.monotonic()
             sem = asyncio.Semaphore(enrich.DADATA_CONCURRENCY)
             rate_limiter = enrich.DaDataRateLimiter(settings["requests_per_second"])
+            budget = enrich.DaDataBudget(remaining_today)
             results = []
             progress_step = 10_000
             logging.info(
@@ -339,12 +354,16 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
                 # небольшими порциями, сохраняя общий лимит параллельных запросов.
                 batch_size = 100
                 for start in range(0, len(to_process), batch_size):
+                    if not budget.remaining:
+                        break
                     tasks = [
-                        enrich.dadata_lookup(session, inn, sem, rate_limiter)
+                        enrich.dadata_lookup(session, inn, sem, rate_limiter, budget)
                         for inn in to_process[start:start + batch_size]
                     ]
                     for coro in asyncio.as_completed(tasks):
-                        results.append(await coro)
+                        result = await coro
+                        if not result.get("deferred"):
+                            results.append(result)
                     processed = len(results)
                     if processed % progress_step == 0 or processed == len(to_process):
                         logging.info(
@@ -356,23 +375,33 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
                                 target=target,
                             )
 
-            usage["count"] += len(to_process)
+            usage["count"] += budget.used
             enrich._save_dadata_usage(usage)
-            enrich.record_dadata_usage(sender, len(to_process))
 
             order = {inn: i for i, inn in enumerate(to_process)}
             results.sort(key=lambda r: order.get(r["inn"], 0))
 
             found = sum(1 for r in results if r.get("found"))
-            not_found = len(results) - found
+            failed = sum(1 for r in results if r.get("error"))
+            not_found = len(results) - found - failed
+            enrich.record_dadata_usage(sender, len(results) - failed)
+            finished_inns = {r["inn"] for r in results if not r.get("error")}
+            remaining_inns = [inn for inn in inns if inn not in finished_inns]
+            skipped = len(remaining_inns) - failed
             logging.info(
                 f"[DaData] Обогащение завершено: {len(results)} ИНН, "
-                f"найдено {found}, не найдено {not_found}"
+                f"найдено {found}, не найдено {not_found}, ошибок {failed}, отложено {skipped}"
             )
 
             date_str = datetime.datetime.now().strftime("%d.%m.%y_%H%M%S_%f")
             out_ext = ".xlsm" if ext == ".xlsm" else ".xlsx"
             out_path = config.CONFIG_DIR / f"enrich_{date_str}{out_ext}"
+            remainder = None
+            if remaining_inns:
+                remainder = out_path.with_name(f"{out_path.stem}_остаток.xlsx")
+                with staged_report(remainder) as staged:
+                    await asyncio.to_thread(enrich.save_remaining_inns, remaining_inns, Path(staged))
+
             logging.info("[DaData] Формирование отчёта %s", out_path.name)
             await asyncio.to_thread(_save_enrichment_report, local_path, out_path, results)
             size_bytes = out_path.stat().st_size
@@ -388,7 +417,7 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
             else:
                 errors = await ym_send_file(
                     str(out_path),
-                    caption=f"Обогащено ИНН: {len(results)} (найдено {found}, не найдено {not_found})",
+                    caption=f"ИНН: найдено {found}, не найдено {not_found}, ошибок {failed}",
                     target=target,
                 )
                 if errors:
@@ -397,14 +426,19 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
             remaining_left = daily_limit - usage["count"]
             elapsed = enrich.format_duration(time.monotonic() - started_at)
             msg = (
-                f"✅ Готово за {elapsed}. Обработано: {len(results)} уникальных ИНН "
-                f"(найдено {found}, не найдено {not_found}).\n"
+                f"{'⚠️' if failed else '✅'} Готово за {elapsed}. Обработано: {found + not_found} уникальных ИНН "
+                f"(найдено {found}, не найдено {not_found}). Ошибок запросов: {failed}.\n"
                 f"📊 Лимит DaData на сегодня: осталось {remaining_left} из {daily_limit}."
             )
             if duplicate_inns and ext in (".xlsx", ".xlsm"):
                 msg += f"\n🔁 Дубли ({duplicate_inns}) заполнены теми же данными без повторных запросов."
             if skipped:
-                msg += f"\n⏸ Отложено (не влезло в дневной лимит): {skipped} ИНН — пришлите файл ещё раз завтра."
+                msg += f"\n⏸ Отложено по дневному лимиту: {skipped} ИНН."
+            if remainder is not None:
+                remainder_errors = await ym_send_file(str(remainder), target=target)
+                location = "Скачайте его в админ-панели → Отчёты → Обогащение ИНН." if remainder_errors else ""
+                msg += (f"\n📎 Для продолжения запустите /обогатить и пришлите {remainder.name} "
+                        f"({len(remaining_inns)} ИНН). {location}").rstrip()
             if delivery_note:
                 msg += (f"\n{delivery_note}\nПолный файл {out_path.name} доступен после входа "
                         "в админ-панель → Отчёты → Обогащение ИНН. "
@@ -425,11 +459,13 @@ async def _dispatch_enrich(context: CommandContext) -> None:
     if not config.enrich_module_settings()["enabled"]:
         await ym_send_text("⏸ Модуль обогащения временно отключён администратором.", target=context.target)
         return
-    _pending_enrich[_sender_key(context.sender)] = {
-        "display_name": context.display_name,
-        "target": context.target,
-        "expires": time.monotonic() + config.PENDING_ENRICH_TIMEOUT_SEC,
-    }
+    key = _enrich_request_key(context.chat, context.sender)
+    if key is None or context.target is None:
+        return
+    now = time.monotonic()
+    for expired in [item for item, expires in _pending_enrich.items() if expires <= now]:
+        del _pending_enrich[expired]
+    _pending_enrich[key] = now + config.PENDING_ENRICH_TIMEOUT_SEC
     await ym_send_text("📎 Жду файл от вас с колонкой «ИНН».", target=context.target)
 
 
@@ -664,20 +700,18 @@ async def listen_commands():
                     continue
 
                 if file_info:
-                    pending = _pending_enrich.get(skey)
-                    if pending and pending["expires"] >= time.monotonic():
-                        del _pending_enrich[skey]
+                    request_key = _enrich_request_key(chat, sender)
+                    expires = _pending_enrich.pop(request_key, 0) if request_key else 0
+                    if target and expires >= time.monotonic() and _enrich_allowed_here(chat, sender):
                         asyncio.create_task(
                             _handle_enrich(
                                 sender, file_info["id"], file_info["name"],
-                                pending["target"],
+                                target,
                             )
                         )
                     else:
                         # файл без предварительной команды /обогатить (или от другого
                         # человека, или после истечения ожидания) — молча игнорируем
-                        if pending:
-                            del _pending_enrich[skey]
                         logging.info(f"[ЯМ] файл от '{display_name}' проигнорирован — не ждали от него файл")
                     continue
 

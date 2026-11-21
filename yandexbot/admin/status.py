@@ -59,15 +59,15 @@ def _age(seconds: float) -> str:
     return f"{seconds // 3600} ч назад"
 
 
-def _schedule_info(module_enabled: bool, auto: dict, last: datetime.datetime | None) -> dict:
+def _schedule_info(module_enabled: bool, auto: dict, state_path: Path) -> dict:
     enabled = module_enabled and auto["enabled"]
-    next_run = schedule.next_run(auto["interval_days"], auto["at"], last) if enabled else None
+    next_run = schedule.next_attempt(state_path, auto["interval_days"], auto["at"]) if enabled else None
     return {
         "module_enabled": module_enabled,
         "auto_enabled": auto["enabled"],
         "interval_days": auto["interval_days"],
         "at": auto["at"],
-        "last": last,
+        "last": schedule.load_last_run(state_path),
         "next": next_run,
         "overdue": next_run is not None and next_run <= datetime.datetime.now(),
     }
@@ -76,13 +76,13 @@ def _schedule_info(module_enabled: bool, auto: dict, last: datetime.datetime | N
 def prices_schedule() -> dict:
     """Расписание плановой выгрузки цен 1СО."""
     settings = config.prices_module_settings()
-    return _schedule_info(settings["enabled"], settings["auto"], schedule.load_last_run(config.STATE_FILE))
+    return _schedule_info(settings["enabled"], settings["auto"], config.STATE_FILE)
 
 
 def epd_schedule() -> dict:
     """Расписание плановой выгрузки цен ЭПД."""
     settings = config.epd_prices_module_settings()
-    return _schedule_info(settings["enabled"], settings["auto"], schedule.load_last_run(config.EPD_STATE_FILE))
+    return _schedule_info(settings["enabled"], settings["auto"], config.EPD_STATE_FILE)
 
 
 def last_fetch(table: str) -> datetime.datetime | None:

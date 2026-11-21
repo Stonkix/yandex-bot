@@ -4,10 +4,11 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from yandexbot import bot
 from yandexbot.admin import store as admin_store
 from yandexbot.core import config
 from yandexbot.core.utils import RUN_KIND_AUTO, RUN_KIND_MANUAL
@@ -44,6 +45,11 @@ class ComparePricesTests(unittest.TestCase):
     def test_no_history(self):
         self.assertIsNone(prices.compare_prices([], {}, KEY, PRICE))
         self.assertIn("первая выгрузка", prices.build_diff_message("СБИС", None))
+
+    def test_missing_amount_is_not_a_price_change(self):
+        row = {"region_code": "77", "tariff_key": "a", "price": None}
+        comparison = prices.compare_prices([row], {("77", "a"): 100}, KEY, PRICE)
+        self.assertEqual(comparison, {"changed": 0, "missing": 1, "new_tariffs": []})
 
     def test_has_news(self):
         self.assertFalse(prices.has_news({"ok": True, "comparison": {"changed": 0, "missing": 0}}))
@@ -111,6 +117,20 @@ class PricesOnlyChangesTests(NotificationTestCase):
         same = {"changed": 0, "missing": 0}
         self._run([same, same], manual=True).assert_awaited()
 
+    def test_admin_run_reports_partial_collection_and_delivery_failure(self):
+        job = {"module_code": "prices", "kind": "full", "delivery": "chat", "target_chat_id": "0/0/general"}
+        for ok, sent, expected_status, expected_message in (
+            (False, True, "failed", "Сбор цен — частично. Доставка — подтверждена."),
+            (True, False, "failed", "Сбор цен — успешно. Доставка — с ошибками"),
+            (True, True, "success", "Сбор цен — успешно. Доставка — подтверждена."),
+        ):
+            result = {"ok": ok, "sent": sent, "files": ["prices.xlsx"], "summary": "итог",
+                      "delivery_errors": [] if sent else ["HTTP 413"]}
+            with self.subTest(result=result), patch.object(prices, "run", new=AsyncMock(return_value=result)):
+                status, summary = asyncio.run(bot._run_admin_job(job))
+                self.assertEqual(status, expected_status)
+                self.assertIn(expected_message, summary)
+
 
 class EpdOnlyChangesTests(NotificationTestCase):
     ROWS = [epd_prices._package_row(1000, 5000.0, epd_prices.SBIS_URL, "")]
@@ -165,6 +185,16 @@ class EpdOnlyChangesTests(NotificationTestCase):
         self.assertTrue(result["sent"])
         self.assertIn("HTTP 403", sent.await_args.args[0])
 
+    def test_excel_failure_leaves_price_history_intact(self):
+        self._seed(self.ROWS)
+        changed = [epd_prices._package_row(1000, 5500.0, epd_prices.SBIS_URL, "")]
+        with patch.object(epd_prices, "save_excel", side_effect=OSError("файл недоступен")):
+            with self.assertRaises(OSError):
+                self._run(changed)
+        with closing(epd_prices.db_connect()) as conn:
+            saved = conn.execute("SELECT DISTINCT price_tariff FROM epd_prices").fetchall()
+            self.assertEqual(saved, [(5000.0,)])
+
     def test_switch_off_sends_same_prices(self):
         self._seed(self.ROWS)
         result, sent, _ = self._run(self.ROWS, only_changes=False)
@@ -214,6 +244,13 @@ class ScheduledBaselineTests(unittest.TestCase):
             )
         finally:
             conn.close()
+
+    def test_blank_prices_in_legacy_sbis_run_do_not_erase_previous_amount(self):
+        with closing(prices.db_connect()) as conn:
+            prices.db_save_prices(conn, "sbis", self._rows(90), "2026-10-01T02:30:00", RUN_KIND_AUTO)
+            prices.db_save_prices(conn, "sbis", self._rows(None), "2026-10-03T02:30:00", RUN_KIND_AUTO)
+            previous = prices.db_get_previous(conn, "sbis", "2026-10-05T02:30:00", RUN_KIND_AUTO)
+        self.assertEqual(previous, {("77", "a"): 90})
 
     def test_epd_manual_run_does_not_hide_change_from_scheduled(self):
         row = {"entry_type": "tariff", "tariff_name": "100 документов", "variant": "",

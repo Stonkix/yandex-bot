@@ -2,6 +2,10 @@
 Общие мелкие утилиты, используемые и парсером цен, и обогащением ИНН.
 """
 
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
 from openpyxl.styles import Font, Alignment, PatternFill
 
 # ─── Стили Excel (общие для всех отчётов) ─────────────────────────────────────
@@ -11,6 +15,15 @@ GREEN  = PatternFill("solid", start_color="C6EFCE", end_color="C6EFCE")
 BOLD   = Font(bold=True)
 CENTER = Alignment(horizontal="center", vertical="center")
 LEFT   = Alignment(horizontal="left",   vertical="center")
+
+
+@contextmanager
+def staged_report(path: Path):
+    """Готовый отчёт заменяет старый файл только после успешного сохранения."""
+    with tempfile.TemporaryDirectory(prefix=".report_", dir=path.parent) as directory:
+        staged = Path(directory) / path.name
+        yield str(staged)
+        staged.replace(path)
 
 
 def apply_diff_fill(cell, old_price, new_price):

@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openpyxl import load_workbook
 
@@ -101,6 +101,7 @@ class SbisPriceListTests(unittest.TestCase):
         source = {
             "Buhta": 12000, "Ent_ausn": 5100, "org_ausn": 8100,
             "EOpSBISfrmUP100N": 210000, "start_ip": 7500, "EOMVD_staff500": 68000,
+            "EOpLiteNIN": 2000, "EOpNI": 900.5, "Filials5": 1500, "Filials100": 10000,
             "Unrelated": 999,
         }
         with patch.object(prices, "sbis_fetch_region", new=AsyncMock(return_value=source)):
@@ -112,6 +113,8 @@ class SbisPriceListTests(unittest.TestCase):
         self.assertEqual(saved["Корп_100"], 210000)
         self.assertEqual(saved["Старт_ИП"], 7500)
         self.assertEqual(saved["МВД_500"], 68000)
+        self.assertEqual(saved["Легкий_доп_направление"], 2000)
+        self.assertEqual(saved["Корп_доп_филиалы_100"], 10000)
         self.assertNotIn("Unrelated", saved)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -123,6 +126,8 @@ class SbisPriceListTests(unittest.TestCase):
                 index = next(cell.column for cell in ws[1] if cell.value == "АУСН")
                 self.assertEqual([ws.cell(2, i).value for i in (index, index + 1)], ["ИП", "ЮЛ"])
                 self.assertEqual([ws.cell(3, i).value for i in (index, index + 1)], [5100, 8100])
+                index = next(cell.column for cell in ws[1] if cell.value == "Дополнительные направления сдачи")
+                self.assertEqual([ws.cell(3, i).value for i in (index, index + 1)], [2000, 900.5])
             finally:
                 wb.close()
 
@@ -147,12 +152,15 @@ def _make_part2_docx(path: str):
     ]
     budget = [["Наименование тарифного плана", "Срок действия", "Состав",
                "Базовая цена без НДС", "НДС", "Итоговая стоимость с НДС"],
-              ["Бюджетник плюс", "1 год", "Право использования ПО", "4 521,07", "–", "5 900,00"]]
+              ["Бюджетник плюс", "1 год", "Право использования ПО", "4 521,07", "–", "5 900,00"],
+              ["Бюджетник", "1 год", "Право использования ПО", "6 819,92", "–", "8 900,00"]]
     ob = [["Наименование тарифного плана", "Срок действия",
            "Количество организаций на обслуживании", "Состав",
            "Базовая цена без НДС", "НДС", "Итоговая стоимость с НДС"],
           ["Общий", "1 год", "1+4 абонента", "Право использования ПО", "13 793,10", "–", "18 000,00"],
-          ["Бюджетная организация", "1 год", "1+9 абонентов", "Право использования ПО", "12 873,56", "–", "16 800,00"]]
+          ["Общий", "1 год", "лицензия +1", "Право использования ПО", "3 065,13", "–", "4 000,00"],
+          ["Бюджетная организация", "1 год", "1+9 абонентов", "Право использования ПО", "12 873,56", "–", "16 800,00"],
+          ["Бюджетная организация", "1 год", "лицензия +5", "Право использования ПО", "5 977,01", "–", "7 800,00"]]
     branch = [
         ["Наименование тарифного плана", "Срок действия", "Количество обособленных подразделений",
          "Система налогообложения", "Состав", "Базовая цена без НДС", "НДС", "Итоговая стоимость с НДС"],
@@ -255,9 +263,12 @@ class KonturPriceListParsingTests(unittest.TestCase):
         other = {(r["table_type"], r["tariff_key"], r["ob_count"]): r["price"]
                  for r in rows if r["table_type"] != "individual"}
         self.assertEqual(other, {
+            ("single_budget", "Бюджетник", None): 8900.0,
             ("single_budget", "Бюджетник плюс", None): 5900.0,
             ("ob_docx", "Общий", 4): 18000.0,
+            ("ob_docx", "Общий", "+1"): 4000.0,
             ("group", "Бюджетная организация", 9): 16800.0,
+            ("group", "Бюджетная организация", "+5"): 7800.0,
             ("other", "1+4 · УСН", None): 15000.0,
             ("other", "1+4 · ОСНО", None): 23000.0,
         })
@@ -308,6 +319,32 @@ class KonturPriceListParsingTests(unittest.TestCase):
         [row] = prices.parse_kontur_pdf_text(ip_text, 77)
         self.assertEqual((row["tariff_key"], row["biz_form"], row["price"]),
                          ("ИП без сотрудников", "ИП без НДС", 7000))
+
+    def test_shared_zero_reporting_price_list_fills_missing_region_link(self):
+        browser = Mock(close=AsyncMock(), new_context=AsyncMock(return_value=Mock(new_page=AsyncMock())))
+        playwright = AsyncMock()
+        playwright.__aenter__.return_value.chromium.launch = AsyncMock(return_value=browser)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            pdf = folder / "96_pricelist.pdf"
+            pdf.touch()
+            docx = folder / "part2.docx"
+            _make_part2_docx(str(docx))
+            with (
+                patch("builtins.print"),
+                patch.object(prices, "async_playwright", return_value=playwright),
+                patch.object(prices, "kontur_download_regional_price_files", new=AsyncMock(
+                    side_effect=[[docx, pdf], [docx]],
+                )),
+                patch.object(prices, "_kontur_pdf_text", return_value=ZERO_PDF_TEXT),
+            ):
+                _, records, *_, incomplete = asyncio.run(
+                    prices.parse_kontur([(1, "Адыгея"), (86, "ХМАО")], folder, region_delay_sec=0)
+                )
+        restored = {row["tariff_key"]: row["price"] for row in records
+                    if row["region_code"] == "86" and row["tariff_key"].startswith("Другие |")}
+        self.assertEqual(restored, {"Другие | Нулевая отчетность": 3300, "Другие | Кадровые отчеты": 3600})
+        self.assertFalse(incomplete)
 
     def test_tax_rep_pdf_handles_wrapped_amounts_and_zone_specific_intervals(self):
         text = """Тарифные планы «Налоговый представитель»

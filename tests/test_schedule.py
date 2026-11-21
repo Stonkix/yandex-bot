@@ -40,6 +40,17 @@ class ScheduleTests(unittest.TestCase):
             schedule.save_last_run(path, D(2026, 9, 18, 9, 1))
             self.assertEqual(schedule.load_last_run(path), D(2026, 9, 18, 9, 1))
 
+    def test_three_failed_attempts_defer_run_to_the_next_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "last.json"
+            last = D(2026, 9, 11, 9, 0)
+            schedule.save_last_run(path, last)
+            for hour in (9, 10, 11):
+                schedule.save_attempt(path, D(2026, 9, 18, hour, 0))
+            self.assertFalse(schedule.should_run(path, 7, "09:00", D(2026, 9, 18, 23, 59)))
+            self.assertEqual(schedule.next_attempt(path, 7, "09:00", D(2026, 9, 18, 12)), D(2026, 9, 19, 9))
+            self.assertEqual(schedule.load_last_run(path), last)
+
 
 class EpdSchedulerTests(unittest.TestCase):
     def setUp(self):
@@ -74,7 +85,7 @@ class EpdSchedulerTests(unittest.TestCase):
         self.assertTrue(self.run_mock.await_args.kwargs["only_changes"])  # по умолчанию включено
         self.assertIsNotNone(epd_prices.load_last_auto_run())
         # Сразу после запуска следующий ещё не положен.
-        self.assertFalse(asyncio.run(epd_prices.scheduler_tick()))
+        self.assertFalse(asyncio.run(epd_prices.scheduler_tick(D(2026, 9, 18, 12, 1))))
         self.assertEqual(self.run_mock.await_count, 1)
 
     def test_disabled_module_does_not_run(self):
@@ -87,7 +98,11 @@ class EpdSchedulerTests(unittest.TestCase):
         self.run_mock.side_effect = RuntimeError("сеть")
         with self.assertRaises(RuntimeError):
             asyncio.run(epd_prices.scheduler_tick(D(2026, 9, 18, 12, 0)))
-        self.assertIsNotNone(epd_prices.load_last_auto_run())
+        self.assertIsNone(epd_prices.load_last_auto_run())
+        self.assertFalse(asyncio.run(epd_prices.scheduler_tick(D(2026, 9, 18, 12, 59))))
+        self.run_mock.side_effect = None
+        self.assertTrue(asyncio.run(epd_prices.scheduler_tick(D(2026, 9, 18, 13, 0))))
+        self.assertEqual(epd_prices.load_last_auto_run(), D(2026, 9, 18, 13, 0))
 
     def test_saving_commands_keeps_schedule(self):
         self._save(True, True, interval=2, at="06:15")

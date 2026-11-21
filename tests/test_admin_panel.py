@@ -328,6 +328,12 @@ class RunsAndReportsTests(PanelTestCase):
         self.post("/runs", {"job": "prices:everything", "delivery": "admin"})
         self.assertEqual(admin_store.list_runs(self.db), [])
 
+    def test_kontur_test_mode_is_removed_from_runs(self):
+        self.login()
+        self.assertNotIn("prices:test", self.client.get("/runs").get_data(as_text=True))
+        self.post("/runs", {"job": "prices:test", "delivery": "admin"})
+        self.assertEqual(admin_store.list_runs(self.db), [])
+
     def test_interrupted_runs_are_marked_failed(self):
         run_id = admin_store.enqueue_run(self.db, "prices", "full", "admin", None, "test")
         admin_store.claim_next_run(self.db)

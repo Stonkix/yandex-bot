@@ -29,7 +29,7 @@ from yandexbot.core import access, config
 from yandexbot.modules import archives
 from yandexbot.core.utils import (
     BOLD, CENTER, LEFT, RUN_KIND_AUTO, RUN_KIND_MANUAL, apply_diff_fill,
-    ensure_run_kind_column, previous_run_filter, progress_text, short_error,
+    ensure_run_kind_column, previous_run_filter, progress_text, short_error, staged_report,
 )
 from yandexbot.messenger.ym_api import ym_send_text, ym_send_file
 from yandexbot.core import schedule, state
@@ -185,8 +185,21 @@ def db_get_previous(conn: sqlite3.Connection, source: str,
     cur = conn.execute("""
         SELECT region_code, tariff_key, price FROM prices
         WHERE source = ? AND fetched_at = ?
-    """, (source, prev_run))
-    return {(r[0], r[1]): r[2] for r in cur.fetchall()}
+    """ + kind_sql, (source, prev_run, *kind_args))
+    previous = {(r[0], r[1]): r[2] for r in cur.fetchall()}
+    # Старые версии сохраняли пустые цены СБИС поверх полного снимка.
+    if source == "sbis":
+        for (region, tariff), price in previous.items():
+            if price is not None:
+                continue
+            row = conn.execute(f"""
+                SELECT price FROM prices WHERE source = ? AND region_code = ? AND tariff_key = ?
+                AND price IS NOT NULL AND fetched_at < ?{kind_sql}
+                ORDER BY fetched_at DESC, id DESC LIMIT 1
+            """, (source, region, tariff, prev_run, *kind_args)).fetchone()
+            if row is not None:
+                previous[(region, tariff)] = row[0]
+    return previous
 
 # ─── СБИС API ────────────────────────────────────────────────────────────────
 
@@ -251,6 +264,17 @@ SBIS_EXCEL_GROUPS = (
         ("Госпроверки", "SBIS_Ar", "Госпроверки"),
         ("Суперсверка", "Super", "Суперсверка"),
         ("Сверка_ЕНС", "ENS_base", "Сверка ЕНС"),
+    )),
+    ("Дополнительные направления сдачи", (
+        ("Легкий_доп_направление", "EOpLiteNIN", "Легкий"),
+        ("Базовый_доп_направление", "EOpNI", "Базовый"),
+    )),
+    ("Корпоративный · доп. филиалы", (
+        ("Корп_доп_филиалы_5", "Filials5", "5"),
+        ("Корп_доп_филиалы_10", "Filials10", "10"),
+        ("Корп_доп_филиалы_25", "Filials25", "25"),
+        ("Корп_доп_филиалы_50", "Filials50", "50"),
+        ("Корп_доп_филиалы_100", "Filials100", "100"),
     )),
 )
 SBIS_NOMENCLATURES = {key: nomenclature for _, items in SBIS_EXCEL_GROUPS for key, nomenclature, _ in items}
@@ -319,7 +343,7 @@ def sbis_extract_row(region_code: str, region_name: str, prices: dict) -> dict:
         "Код региона": int(region_code),
         "Название": region_name,
         **{
-            key: int(prices[code]) if prices.get(code) is not None else None
+            key: prices.get(code)
             for key, code in SBIS_NOMENCLATURES.items()
         },
     }
@@ -459,7 +483,7 @@ KONTUR_BIZ_FORMS = [
     "ЮЛ на АУСН",
 ]
 
-DOCX_SINGLE_BUDGET_TARIFFS = ["Бюджетник плюс", "Бюджетник Максимальный"]
+DOCX_SINGLE_BUDGET_TARIFFS = ["Бюджетник", "Бюджетник плюс", "Бюджетник Максимальный"]
 
 # Тарифы из отдельных прайсов региона: группа (префикс ключа в БД) → заголовок
 # в Excel. Колонки внутри группы добавляются по мере появления в прайсах.
@@ -469,18 +493,20 @@ KONTUR_OTHER_GROUPS = {
     "НП": "Налоговый представитель, 12 мес.",
     "НП за документ": "Налоговый представитель: цена за документ",
 }
-KONTUR_OTHER_TARIFFS = [("Другие", "Нулевая отчетность")]
+ZERO_REPORT_TARIFFS = ("Нулевая отчетность", "Кадровые отчеты")
+KONTUR_OTHER_TARIFFS = [("Другие", ZERO_REPORT_TARIFFS[0])]
 KONTUR_ZONAL_OB_NAMES = ("ОБ Универсальный", "ОБ Все включено")
 
 # Прайс «Налоговый представитель»: тарифы по регионам берутся за 12 месяцев —
 # как «1 год» у остальных тарифов.
 TAX_REP_PERIOD = "12 мес."
 
-_COUNT_MAP = {
-    "1+4 абонента": 4,   "1+9 абонентов": 9,   "1+19 абонентов": 19,
-    "1+49 абонентов": 49, "1+99 абонентов": 99, "1+199 абонентов": 199,
-    "1+499 абонентов": 499,
-}
+def _docx_package_count(label: str) -> int | str | None:
+    base = re.fullmatch(r"1\+(\d+) абонент(?:а|ов)?", label)
+    if base:
+        return int(base[1])
+    license_count = re.fullmatch(r"лицензия (\+\d+)", label, re.IGNORECASE)
+    return license_count[1] if license_count else None
 
 
 def _price_for_display(value: float) -> float:
@@ -610,7 +636,7 @@ def parse_docx_pricelist(path: str, region_id: int = 0) -> list[dict]:
                     "ob_count":   None,
                 })
             elif count_i is not None:
-                count = _COUNT_MAP.get(cur_count_raw)
+                count = _docx_package_count(cur_count_raw)
                 if count is None:
                     continue
                 if cur_tariff in DOCX_OB_TARIFF_NAMES:
@@ -1108,11 +1134,12 @@ def _parse_widget_html(html_str: str) -> list[dict]:
 
 
 async def parse_kontur(
-    regions: list, progress_cb=None, region_delay_sec: float = 1.0,
+    regions: list, source_dir: Path, progress_cb=None, region_delay_sec: float = 1.0,
     main_files_only: bool = False,
 ) -> tuple:
     rows_by_region: dict[str, dict] = {}
     db_records: list[dict] = []
+    incomplete_regions: set[str] = set()
 
     msb_col_order: list[tuple] = []
     msb_col_set:   set         = set()
@@ -1121,17 +1148,27 @@ async def parse_kontur(
         name: set() for name in (*OB_TARIFF_NAMES.values(), *KONTUR_ZONAL_OB_NAMES)
     }
 
-    docx_col_order: list[tuple] = [
-        (DOCX_TARIFF_NAMES[name], count)
-        for name in DOCX_TARIFF_NAMES
-        for count in OB_COUNTS
-    ]
+    docx_columns: dict[str, set[int | str]] = {
+        name: set(OB_COUNTS) for name in DOCX_TARIFF_NAMES.values()
+    }
 
     sb_col_order: list[str] = list(DOCX_SINGLE_BUDGET_TARIFFS)
     other_col_order: list[tuple[str, str]] = list(KONTUR_OTHER_TARIFFS)
+    zero_reporting_pdfs: set[str] = set()
+
+    def store_other(code: str, region_name: str, region_row: dict, tariff: dict) -> None:
+        group, name = tariff.get("group", "Другие"), tariff["tariff_key"]
+        if (group, name) not in other_col_order:
+            other_col_order.append((group, name))
+        region_row[("other", group, name)] = tariff["price"]
+        db_records.append({
+            "region_code": code,
+            "region_name": region_name,
+            "tariff_key": f"{group} | {name}",
+            "price": tariff["price"],
+        })
 
     total = len(regions)
-    source_dir = Path(tempfile.mkdtemp(prefix="kontur_sources_"))
     # Общие для нескольких регионов PDF скачиваются для архивов, а текст извлекается один раз.
     pdf_text = lru_cache(maxsize=8)(_kontur_pdf_text)
 
@@ -1167,7 +1204,12 @@ async def parse_kontur(
                             f"[pdf][{region_id}] не удалось проверить {source_file.name}: {e}"
                         )
                         continue
+                    if "«Нулевая отчетность»" in " ".join(text[:1000].split()):
+                        zero_reporting_pdfs.add(text)
                     pdf_parsed.extend(parse_kontur_pdf_text(text, region_id))
+
+            if not any(row["table_type"] == "individual" for row in docx_parsed):
+                incomplete_regions.add(code)
 
             for t in [*docx_parsed, *pdf_parsed]:
                 tt = t["table_type"]
@@ -1193,12 +1235,14 @@ async def parse_kontur(
                         "price":       t["price"],
                     })
                 elif tt == "group":
-                    docx_key = ("docx_group", t["tariff_key"], t["ob_count"])
+                    name, count = t["tariff_key"], t["ob_count"]
+                    docx_columns[name].add(count)
+                    docx_key = ("docx_group", name, count)
                     region_row[docx_key] = t["price"]
                     db_records.append({
                         "region_code": code,
                         "region_name": region_name,
-                        "tariff_key":  f"Docx | {t['tariff_key']} | 1+{t['ob_count']}",
+                        "tariff_key":  f"Docx | {name} | {_ob_package_label(count)}",
                         "price":       t["price"],
                     })
                 elif tt == "ob_docx":
@@ -1213,16 +1257,7 @@ async def parse_kontur(
                         "price": t["price"],
                     })
                 elif tt == "other":
-                    other_key = (t.get("group", "Другие"), t["tariff_key"])
-                    if other_key not in other_col_order:
-                        other_col_order.append(other_key)
-                    region_row[("other", *other_key)] = t["price"]
-                    db_records.append({
-                        "region_code": code,
-                        "region_name": region_name,
-                        "tariff_key": f"{other_key[0]} | {other_key[1]}",
-                        "price": t["price"],
-                    })
+                    store_other(code, region_name, region_row, t)
 
             if progress_cb:
                 await progress_cb(done, total, region_name)
@@ -1230,18 +1265,33 @@ async def parse_kontur(
 
         await browser.close()
 
-    ob_col_order = [
-        (name, count)
-        for name, counts in ob_columns.items()
-        for count in sorted(counts, key=lambda value: (isinstance(value, str), int(value)))
-    ]
+    if len(zero_reporting_pdfs) == 1:
+        # Общий PDF содержит региональные цены. Ссылка на него бывает не на
+        # каждой странице региона, хотя цена в самом прайсе опубликована.
+        [shared_price_list] = zero_reporting_pdfs
+        for region_id, region_name in regions:
+            code = str(region_id)
+            region_row = rows_by_region[code]
+            missing = {name for name in ZERO_REPORT_TARIFFS if ("other", "Другие", name) not in region_row}
+            if missing:
+                for tariff in parse_kontur_pdf_text(shared_price_list, region_id):
+                    if tariff["tariff_key"] in missing:
+                        store_other(code, region_name, region_row, tariff)
 
     rows = [
         (str(rid), rname, rows_by_region.get(str(rid), {"region_name": rname}))
         for rid, rname in regions
     ]
-    return (rows, db_records, msb_col_order, ob_col_order, docx_col_order,
-            sb_col_order, other_col_order, source_dir)
+    return (rows, db_records, msb_col_order, _ob_column_order(ob_columns), _ob_column_order(docx_columns),
+            sb_col_order, other_col_order, incomplete_regions)
+
+
+def _ob_column_order(columns: dict[str, set[int | str]]) -> list[tuple[str, int | str]]:
+    return [
+        (name, count)
+        for name, counts in columns.items()
+        for count in sorted(counts, key=lambda value: (isinstance(value, str), int(value)))
+    ]
 
 
 def _ob_package_label(count: int | str) -> str:
@@ -1383,7 +1433,7 @@ def save_kontur_excel(
 
     for (tname, cnt), col_i in docx_col_map.items():
         ws.cell(1, col_i).value = tname;      ws.cell(1, col_i).font = BOLD; ws.cell(1, col_i).alignment = CENTER; ws.cell(1, col_i).fill = GREEN_FILL
-        ws.cell(2, col_i).value = f"1+{cnt}"; ws.cell(2, col_i).font = BOLD; ws.cell(2, col_i).alignment = CENTER; ws.cell(2, col_i).fill = GREEN_DARK
+        ws.cell(2, col_i).value = _ob_package_label(cnt); ws.cell(2, col_i).font = BOLD; ws.cell(2, col_i).alignment = CENTER; ws.cell(2, col_i).fill = GREEN_DARK
 
     for tname, col_i in sb_col_map.items():
         ws.cell(1, col_i).value = "Одиночные бюджетники"; ws.cell(1, col_i).font = BOLD; ws.cell(1, col_i).alignment = CENTER; ws.cell(1, col_i).fill = PURPLE_LIGHT
@@ -1458,7 +1508,7 @@ def save_kontur_excel(
         for (tname, cnt), col_i in docx_col_map.items():
             price = price_dict.get(("docx_group", tname, cnt))
             pc = ws.cell(r, col_i); pc.alignment = CENTER
-            apply_diff_fill(pc, prev.get((code, f"Docx | {tname} | 1+{cnt}")), price)
+            apply_diff_fill(pc, prev.get((code, f"Docx | {tname} | {_ob_package_label(cnt)}")), price)
 
         for tname, col_i in sb_col_map.items():
             price = price_dict.get(("docx_sb", tname))
@@ -1497,16 +1547,16 @@ def compare_prices(all_rows, prev: dict, key_fn, price_fn) -> dict | None:
     """
     if not prev:
         return None
-    changed = 0
+    previous = {key: value for key, value in prev.items() if value is not None}
+    current = {}
     for row in all_rows:
         new = price_fn(row)
-        old = prev.get(key_fn(row))
-        if old is None or new is None or old == new:
-            continue
-        changed += 1
-    missing = len(prev.keys() - {key_fn(row) for row in all_rows})
-    prev_tariffs = {key[1] for key in prev}
-    new_tariffs = sorted({key_fn(row)[1] for row in all_rows} - prev_tariffs)
+        if new is not None:
+            current[key_fn(row)] = new
+    changed = sum(previous[key] != current[key] for key in previous.keys() & current.keys())
+    missing = len(previous.keys() - current.keys())
+    prev_tariffs = {key[1] for key in previous}
+    new_tariffs = sorted({key[1] for key in current} - prev_tariffs)
     return {"changed": changed, "missing": missing, "new_tariffs": new_tariffs}
 
 
@@ -1515,7 +1565,8 @@ def build_diff_message(source: str, comparison: dict | None) -> str:
         return f"📊 {source}: первая выгрузка, история сравнения отсутствует."
     changed, missing = comparison["changed"], comparison["missing"]
     lines = [f"⚠️ {source}: изменилось {changed} цен." if changed
-             else f"✅ {source}: изменений цен не обнаружено."]
+             else f"✅ {source}: изменений цен не обнаружено." if not missing
+             else f"⚠️ {source}: часть цен не получена."]
     if missing:
         lines.append(f"⚠️ {source}: нет данных по {missing} позициям из прошлой выгрузки.")
     new_tariffs = comparison.get("new_tariffs") or []
@@ -1541,7 +1592,7 @@ async def run_sbis(delay_sec: float = 0.3, sources_dir: Path | None = None,
 
     run_kind — RUN_KIND_AUTO/RUN_KIND_MANUAL: с какой прошлой выгрузкой сравнивать.
     """
-    now_str  = datetime.datetime.now().isoformat(timespec="seconds")
+    now_str  = datetime.datetime.now().isoformat(timespec="microseconds")
     date_str = datetime.datetime.now().strftime("%d.%m.%y")
     conn     = db_connect()
 
@@ -1560,18 +1611,29 @@ async def run_sbis(delay_sec: float = 0.3, sources_dir: Path | None = None,
         if not any(row["price"] is not None for row in db_s):
             raise RuntimeError("в каталоге не найдено ни одной цены отчётности")
         prev_s = db_get_previous(conn, "sbis", now_str, run_kind)
-        db_save_prices(conn, "sbis", db_s, now_str, run_kind)
-
-        xlsx_s = str(config.CONFIG_DIR / f"sbis_{date_str}.xlsx")
-        save_sbis_excel(rows_s, prev_s, xlsx_s)
-
         comparison = compare_prices(
             db_s, prev_s,
             key_fn   = lambda r: (r["region_code"].zfill(2), r["tariff_key"]),
             price_fn = lambda r: r["price"],
         )
-        return {"ok": True, "summary": build_diff_message("СБИС", comparison),
-                "file": xlsx_s, "comparison": comparison}
+        expected = {str(code).zfill(2) for code, _ in REGIONS_SBIS}
+        priced_rows = [r for r in db_s if r["price"] is not None]
+        received = {r["region_code"] for r in priced_rows}
+        full = len(priced_rows) == len(expected) * len(SBIS_NOMENCLATURES)
+        full = full and expected <= received and not (comparison and comparison["missing"])
+        suffix = "" if full else "_partial"
+        output = config.CONFIG_DIR / f"sbis_{date_str}{suffix}.xlsx"
+        with staged_report(output) as staged:
+            save_sbis_excel(rows_s, prev_s, staged)
+        summary = build_diff_message("СБИС", comparison)
+        if full:
+            db_save_prices(conn, "sbis", db_s, now_str, run_kind)
+        else:
+            summary += (
+                f"\n⚠️ СБИС: цены получены по {len(expected & received)} из {len(expected)} регионов, "
+                f"{len(priced_rows)} из {len(expected) * len(SBIS_NOMENCLATURES)} позиций. Снимок неполный."
+            )
+        return {"ok": full, "summary": summary, "file": str(output), "comparison": comparison}
     except Exception as e:
         logging.error(f"Ошибка парсинга СБИС: {e}", exc_info=True)
         return {"ok": False, "summary": f"❌ СБИС: {short_error(e)}", "file": None}
@@ -1602,7 +1664,7 @@ async def run_kontur(
             "file": None,
         }
 
-    now_str  = datetime.datetime.now().isoformat(timespec="seconds")
+    now_str  = datetime.datetime.now().isoformat(timespec="microseconds")
     date_str = datetime.datetime.now().strftime("%d.%m.%y")
     conn     = db_connect()
 
@@ -1613,25 +1675,19 @@ async def run_kontur(
 
     source_dir: Path | None = None
     try:
-        rows_k, db_k, msb_o, ob_o, docx_o, sb_o, other_o, source_dir = await parse_kontur(
-            regions, progress_hook, region_delay_sec=region_delay_sec,
+        source_dir = Path(tempfile.mkdtemp(prefix="kontur_sources_"))
+        rows_k, db_k, msb_o, ob_o, docx_o, sb_o, other_o, incomplete_regions = await parse_kontur(
+            regions, source_dir, progress_hook, region_delay_sec=region_delay_sec,
             main_files_only=main_files_only,
         )
         if not db_k:
             raise RuntimeError("в региональных прайсах не найдено ни одной цены отчётности")
 
         prev_k = {} if test else db_get_previous(conn, "kontur", now_str, run_kind)
-        if not test:
-            db_save_prices(conn, "kontur", db_k, now_str, run_kind)
-
-        suffix = "kontur_test" if test else "kontur"
-        xlsx_k = str(config.CONFIG_DIR / f"{suffix}_{date_str}.xlsx")
-        save_kontur_excel(rows_k, msb_o, ob_o, docx_o, sb_o, other_o, prev_k, xlsx_k)
-        if sources_dir is not None:
-            shutil.copytree(source_dir, sources_dir / "kontur", dirs_exist_ok=True)
-        shutil.rmtree(source_dir, ignore_errors=True)
-
         comparison = None
+        expected = {str(code) for code, _ in regions}
+        received = {r["region_code"] for r in db_k} - incomplete_regions
+        full = expected <= received
         if test:
             summary = f"🧪 {label}: {total} регионов обработано (тест, без записи в БД)."
         else:
@@ -1641,7 +1697,20 @@ async def run_kontur(
                 price_fn = lambda r: r["price"],
             )
             summary = build_diff_message(label, comparison)
-        return {"ok": True, "summary": summary, "file": xlsx_k, "comparison": comparison}
+            if comparison and comparison["missing"]:
+                full = False
+        prefix = "kontur_test" if test else "kontur"
+        suffix = "" if full else "_partial"
+        output = config.CONFIG_DIR / f"{prefix}_{date_str}{suffix}.xlsx"
+        with staged_report(output) as staged:
+            save_kontur_excel(rows_k, msb_o, ob_o, docx_o, sb_o, other_o, prev_k, staged)
+        if not test and full:
+            db_save_prices(conn, "kontur", db_k, now_str, run_kind)
+        if sources_dir is not None:
+            shutil.copytree(source_dir, sources_dir / "kontur", dirs_exist_ok=True)
+        if not full:
+            summary += f"\n⚠️ Контур: цены получены по {len(expected & received)} из {len(expected)} регионов. Снимок неполный."
+        return {"ok": full, "summary": summary, "file": str(output), "comparison": comparison}
     except Exception as e:
         logging.error(f"Ошибка парсинга Контур: {e}", exc_info=True)
         return {"ok": False, "summary": f"❌ {label}: {short_error(e)}", "file": None}
@@ -1694,17 +1763,18 @@ async def run(source: str, announce: bool = False, announce_text: str | None = N
     manual = announce or announce_text is not None
     profile = profile or ("manual" if manual else "auto")
     run_settings = config.prices_run_settings(profile)
+    started = datetime.datetime.now()
 
     if not manual and not force:
         auto_schedule = config.prices_auto_schedule()
         if not auto_schedule["module_enabled"] or not auto_schedule["enabled"]:
             logging.info("Плановый запуск цен отключён в настройках модуля")
             return
-        last = _load_last_auto_run()
-        if not schedule.is_due(auto_schedule["interval_days"], auto_schedule["at"], last):
+        if not schedule.should_run(config.STATE_FILE, auto_schedule["interval_days"], auto_schedule["at"], started):
             return
 
-    started = datetime.datetime.now()
+    if not manual:
+        schedule.save_attempt(config.STATE_FILE, started)
     date_str = started.strftime("%d.%m.%y")
 
     if manual:
@@ -1751,31 +1821,37 @@ async def run(source: str, announce: bool = False, announce_text: str | None = N
             shutil.rmtree(sources_dir, ignore_errors=True)
 
     auto_schedule = config.prices_auto_schedule()
+    ok = bool(results) and all(result["ok"] for result in results)
+    files = [result["file"] for result in results if result.get("file")]
+    if not manual and ok:
+        _save_last_auto_run(datetime.datetime.now())
     if not manual and auto_schedule["only_changes"] and results and not any(map(has_news, results)):
         # Плановая выгрузка без изменений: Excel и история уже сохранены,
         # в чаты не пишем, чтобы не повторять одни и те же цены.
         logging.info("[1СО] плановая выгрузка: цены без изменений — итог в чаты не отправляется")
-        _save_last_auto_run(datetime.datetime.now())
-        return
+        return {"ok": True, "summary": "\n".join(r["summary"] for r in results),
+                "files": files, "sent": False, "delivery_errors": []}
 
     summary_lines = [f"📦 Выгрузка — {date_str}", ""]
     summary_lines += [r["summary"] for r in results]
     if archive is not None:
         summary_lines += ["", f"🗄 Архив исходников: {archive.name}"]
     if not manual:
-        next_run = schedule.next_run(auto_schedule["interval_days"], auto_schedule["at"], datetime.datetime.now())
-        summary_lines += [
-            "", f"🗓 Следующая автоматическая выгрузка: "
-            f"{next_run.strftime('%d.%m.%y')} в {auto_schedule['at']}",
-        ]
-    await ym_send_text("\n".join(summary_lines), target=recipients())
-
-    for r in results:
-        if r["file"]:
-            await ym_send_file(r["file"], target=recipients())
-
-    if not manual:
-        _save_last_auto_run(datetime.datetime.now())
+        if ok:
+            next_run = schedule.next_run(auto_schedule["interval_days"], auto_schedule["at"], datetime.datetime.now())
+            summary_lines += ["", f"🗓 Следующая автоматическая выгрузка: {next_run:%d.%m.%y} в {auto_schedule['at']}"]
+        else:
+            summary_lines += ["", "🗓 При неполной выгрузке повтор — не раньше чем через час."]
+    targets = recipients()
+    delivery_errors = []
+    for file in files:
+        delivery_errors.extend(await ym_send_file(file, target=targets) or [])
+    if delivery_errors:
+        summary_lines += ["", "⚠ Вложения доставлены не всем получателям. Файлы доступны в панели → Отчёты."]
+    summary = "\n".join(summary_lines)
+    delivery_errors.extend(await ym_send_text(summary, target=targets) or [])
+    return {"ok": ok, "summary": summary, "files": files, "sent": not delivery_errors,
+            "delivery_errors": delivery_errors}
 
 
 # ─── Плановая выгрузка раз в 7 дней (для --daemon) ────────────────────────────

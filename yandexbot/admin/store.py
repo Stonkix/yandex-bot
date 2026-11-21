@@ -298,7 +298,6 @@ def update_password(path: Path, username: str, password_hash: str) -> None:
 # Какие задания панель умеет ставить в очередь: (module_code, kind) → подпись.
 RUN_KINDS = {
     ("prices", "full"): "Цены 1СО: все регионы",
-    ("prices", "test"): "Цены 1СО: тест Контура (5 регионов)",
     ("epd_prices", "full"): "Цены ЭПД",
 }
 DELIVERIES = {"broadcast": "В чаты рассылки модуля", "admin": "Только администратору", "chat": "В выбранный чат"}

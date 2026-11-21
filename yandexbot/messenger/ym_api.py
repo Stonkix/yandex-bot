@@ -38,7 +38,7 @@ def _resolve_targets(target: dict | list[dict] | None) -> list[dict]:
 
 
 async def ym_send_text(text: str, target: dict | list[dict] | None = None,
-                       suggest_buttons: dict | None = None):
+                       suggest_buttons: dict | None = None) -> list[str]:
     """
     target=None -> уходит всем broadcast-чатам (рассылка цен и т.п.).
     target={"chat_id"|"login": ...} -> ответ конкретно туда, откуда пришла команда.
@@ -66,8 +66,9 @@ async def ym_send_text(text: str, target: dict | list[dict] | None = None,
     targets = _resolve_targets(target)
     if not targets:
         logging.error("[ЯМ] Нет ни одного получателя (broadcast_chat_ids пуст и login не задан)")
-        return
+        return ["нет получателей"]
 
+    errors = []
     async with aiohttp.ClientSession() as session:
         for tgt in targets:
             for part in chunks:
@@ -77,11 +78,22 @@ async def ym_send_text(text: str, target: dict | list[dict] | None = None,
                 try:
                     async with session.post(url, json=payload, headers=headers,
                                             timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        data = await resp.json(content_type=None)
-                        if not data.get("ok"):
-                            logging.error(f"[ЯМ] Ошибка отправки текста в {tgt}: {data.get('description')}")
+                        try:
+                            data = await resp.json(content_type=None)
+                        except ValueError:
+                            data = None
+                        if 200 <= resp.status < 300 and isinstance(data, dict) and data.get("ok"):
+                            continue
+                        description = data.get("description") if isinstance(data, dict) else None
+                        error = f"HTTP {resp.status}"
+                        if description:
+                            error += f" — {description}"
+                        logging.error("[ЯМ] Ошибка отправки текста в %s: %s", tgt, error)
+                        errors.append(error)
                 except Exception as e:
                     logging.error(f"[ЯМ] Ошибка отправки текста в {tgt}: {e}")
+                    errors.append(type(e).__name__)
+    return errors
 
 
 def _upload_timeout(size_bytes: int) -> aiohttp.ClientTimeout:

@@ -120,6 +120,19 @@ class DaDataRateLimiter:
                 await asyncio.sleep(wait_seconds)
 
 
+class DaDataBudget:
+    def __init__(self, limit: int):
+        self.remaining = limit
+        self.used = 0
+
+    def take(self) -> bool:
+        if not self.remaining:
+            return False
+        self.remaining -= 1
+        self.used += 1
+        return True
+
+
 def _load_dadata_usage() -> dict:
     today = datetime.date.today().isoformat()
     if config.DADATA_USAGE_FILE.is_file():
@@ -134,7 +147,7 @@ def _load_dadata_usage() -> dict:
 
 def _save_dadata_usage(usage: dict):
     try:
-        config.DADATA_USAGE_FILE.write_text(json.dumps(usage), encoding="utf-8")
+        config.DADATA_USAGE_FILE.write_text(json.dumps(usage, ensure_ascii=False), encoding="utf-8", newline="\n")
     except Exception as e:
         logging.error(f"Не удалось сохранить {config.DADATA_USAGE_FILE}: {e}")
 
@@ -342,7 +355,9 @@ def _smb_fields(data: dict) -> dict:
 
 def _enrich_values(result: dict, finance_years: list[int], phone_count: int, email_count: int) -> list:
     if not result.get("found"):
-        return ["НЕ НАЙДЕНО"] + [""] * (len(_enrich_headers(finance_years, phone_count, email_count)) - 1)
+        error = result.get("error")
+        status = f"ОШИБКА ЗАПРОСА: {error}" if error else "НЕ НАЙДЕНО"
+        return [status] + [""] * (len(_enrich_headers(finance_years, phone_count, email_count)) - 1)
     finance_by_year = result.get("finance_by_year") or {}
     finance_values = [
         (finance_by_year.get(year) or {}).get(metric, "")
@@ -416,36 +431,53 @@ def save_enriched_source_excel(source_path: str, filepath: str, results: list[di
 
 
 async def dadata_lookup(session: aiohttp.ClientSession, inn: str,
-                        sem: asyncio.Semaphore, rate_limiter: DaDataRateLimiter) -> dict:
+                        sem: asyncio.Semaphore, rate_limiter: DaDataRateLimiter,
+                        budget: DaDataBudget | None = None) -> dict:
     headers = {
         "Content-Type":  "application/json",
         "Accept":        "application/json",
         "Authorization": f"Token {config.DADATA_TOKEN}",
     }
-    async with sem:
-        await rate_limiter.wait_turn()
-        try:
-            async with session.post(
-                DADATA_URL, json={"query": inn}, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                if resp.status != 200:
-                    body = (await resp.text()).strip()[:300]
-                    logging.warning(f"[DaData] {inn}: HTTP {resp.status}: {body}")
-                    return {"inn": inn, "found": False}
-                data = await resp.json(content_type=None)
-                if not isinstance(data, dict):
-                    logging.warning(f"[DaData] {inn}: получен ответ не в формате JSON-объекта")
-                    return {"inn": inn, "found": False}
-        except Exception as e:
-            logging.error(f"[DaData] {inn}: {e}")
-            return {"inn": inn, "found": False}
-    suggestions = data.get("suggestions") or []
+    error = None
+    for attempt in range(3):
+        pause = 2 ** attempt
+        async with sem:
+            if budget is not None and not budget.take():
+                return {"inn": inn, "found": False, "error": error, "deferred": error is None}
+            await rate_limiter.wait_turn()
+            try:
+                async with session.post(
+                    DADATA_URL, json={"query": inn}, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        suggestions = data.get("suggestions") if isinstance(data, dict) else None
+                        if not isinstance(suggestions, list) or (suggestions and not isinstance(suggestions[0], dict)):
+                            return {"inn": inn, "found": False, "error": "некорректный ответ DaData"}
+                        break
+                    error = f"HTTP {resp.status}"
+                    if resp.status != 429 and not 500 <= resp.status < 600:
+                        return {"inn": inn, "found": False, "error": error}
+                    retry_after = getattr(resp, "headers", {}).get("Retry-After", "")
+                    if retry_after.isdigit():
+                        pause = max(pause, min(int(retry_after), 30))
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                error = type(exc).__name__
+            except ValueError:
+                return {"inn": inn, "found": False, "error": "некорректный ответ DaData"}
+        if attempt < 2 and (budget is None or budget.remaining):
+            await asyncio.sleep(pause)
+    else:
+        logging.warning("[DaData] запрос не выполнен: %s", error)
+        return {"inn": inn, "found": False, "error": error}
     if not suggestions:
         return {"inn": inn, "found": False}
 
     s = suggestions[0]
-    d = s.get("data") or {}
+    d = s.get("data")
+    if not isinstance(d, dict):
+        return {"inn": inn, "found": False, "error": "некорректный ответ DaData"}
     mgmt   = d.get("management") or {}
     opf    = d.get("opf") or {}
     addr   = d.get("address") or {}
@@ -557,10 +589,7 @@ def save_dadata_excel(results: list[dict], filepath: str):
         ws.cell(1, c).alignment = CENTER
 
     for r in results:
-        if not r.get("found"):
-            row = [r["inn"], "НЕ НАЙДЕНО"] + [""] * (len(headers) - 2)
-        else:
-            row = [r["inn"], *_enrich_values(r, finance_years, phone_count, email_count)]
+        row = [r["inn"], *_enrich_values(r, finance_years, phone_count, email_count)]
         ws.append(row)
         r_idx = ws.max_row
         if not r.get("found"):
@@ -571,4 +600,13 @@ def save_dadata_excel(results: list[dict], filepath: str):
     for i, header in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(i)].width = 36 if header in wide_headers else 16
     ws.freeze_panes = "A2"
+    wb.save(filepath)
+
+
+def save_remaining_inns(inns: list[str], filepath: Path) -> None:
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Остаток ИНН")
+    ws.append(["ИНН"])
+    for inn in inns:
+        ws.append([inn])
     wb.save(filepath)

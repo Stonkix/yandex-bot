@@ -1,7 +1,8 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openpyxl import Workbook, load_workbook
 
@@ -121,6 +122,60 @@ class EnrichStatsTest(unittest.TestCase):
 
 
 class EnrichDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_dadata_retry_uses_quota_and_keeps_http_error(self):
+        response = AsyncMock()
+        response.__aenter__.return_value = response
+        response.status = 429
+        response.headers = {"Retry-After": "1"}
+        session = Mock()
+        session.post.return_value = response
+        budget = enrich.DaDataBudget(2)
+        limiter = Mock(wait_turn=AsyncMock())
+        with patch.object(enrich.asyncio, "sleep", new=AsyncMock()):
+            result = await enrich.dadata_lookup(session, "7707083893", asyncio.Semaphore(1), limiter, budget)
+        self.assertEqual((result["error"], result["found"], budget.used), ("HTTP 429", False, 2))
+        self.assertEqual(session.post.call_count, 2)
+
+    def test_pending_request_key_is_scoped_to_chat_and_sender(self):
+        alice = {"login": "alice"}
+        bob = {"login": "bob"}
+        group = {"id": "first", "type": "group"}
+        other_group = {**group, "id": "second"}
+        self.assertNotEqual(bot._enrich_request_key(group, alice), bot._enrich_request_key(other_group, alice))
+        self.assertNotEqual(bot._enrich_request_key(group, alice), bot._enrich_request_key(group, bob))
+
+    async def test_remainder_contains_only_unprocessed_and_failed_inns(self):
+        target = {"login": "test-user"}
+        settings = {"enabled": True, "daily_limit": 2, "requests_per_second": 25}
+        inns = ["7707083893", "7702070139", "7702319337"]
+
+        async def download(_session, _file_id, path):
+            Path(path).write_text("\n".join(inns), encoding="utf-8", newline="\n")
+
+        async def lookup(_session, inn, _sem, _limiter, budget):
+            self.assertTrue(budget.take())
+            return {"inn": inn, "found": False, **({"error": "HTTP 503"} if inn == inns[1] else {})}
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(bot.config, "CONFIG_DIR", Path(tmp)),
+            patch.object(bot.config, "DADATA_TOKEN", "test"),
+            patch.object(bot.config, "enrich_module_settings", return_value=settings),
+            patch.object(bot, "ym_download_file", side_effect=download),
+            patch.object(bot, "ym_send_file", new=AsyncMock(return_value=[])),
+            patch.object(bot, "ym_send_text", new=AsyncMock()) as send_text,
+            patch.object(enrich, "_load_dadata_usage", return_value={"count": 0}),
+            patch.object(enrich, "_save_dadata_usage") as save_usage,
+            patch.object(enrich, "record_dadata_usage"),
+            patch.object(enrich, "dadata_lookup", side_effect=lookup),
+        ):
+            await bot._handle_enrich(target, "file-id", "source.txt", target)
+            remainder, = Path(tmp).glob("*_остаток.xlsx")
+            self.assertEqual(enrich.extract_inns_from_xlsx(str(remainder)), inns[1:])
+        save_usage.assert_called_once_with({"count": 2})
+        self.assertIn("не найдено 1", send_text.await_args.args[0])
+        self.assertIn("Ошибок запросов: 1", send_text.await_args.args[0])
+
     async def test_saved_report_is_available_when_attachment_cannot_be_delivered(self):
         target = {"login": "test-user"}
         settings = {"enabled": True, "daily_limit": 10, "requests_per_second": 25}
