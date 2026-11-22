@@ -12,7 +12,7 @@ from openpyxl import Workbook, load_workbook
 from yandexbot import bot
 from yandexbot.admin import status
 from yandexbot.admin import store
-from yandexbot.modules import enrich
+from yandexbot.modules import dadata_store, enrich
 
 
 class EnrichStatsTest(unittest.TestCase):
@@ -161,6 +161,35 @@ class EnrichDeliveryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reconstructed, rows)
             self.assertTrue(output.exists())
 
+    async def test_poller_reports_and_recovers_from_get_updates_errors(self):
+        dns_error = OSError("getaddrinfo failed")
+        responses = [dns_error, dns_error, {"ok": False, "description": "API недоступен"},
+                     {"ok": True, "updates": []}, asyncio.CancelledError()]
+        statuses = []
+
+        async def record_status(delay):
+            chat, = status.bot_status()
+            statuses.append((delay, chat["title"], chat["ok"]))
+
+        with (
+            patch.object(bot.state, "heartbeat", {}),
+            patch.object(bot.state, "listen_error", None),
+            patch.object(bot, "_load_offset", return_value=None),
+            patch.object(bot, "ym_get_updates", new=AsyncMock(side_effect=responses)),
+            patch.object(bot.asyncio, "sleep", side_effect=record_status),
+            patch("builtins.print"),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await bot.listen_commands()
+
+        self.assertEqual(statuses, [(5, "Чат · ошибка опроса", False)] * 3 + [(1, "Чат", True)])
+        self.assertEqual([record.getMessage() for record in logs.records], [
+            "[ЯМ] Ошибка getUpdates: getaddrinfo failed",
+            "[ЯМ] getUpdates вернул ошибку: API недоступен",
+            "[ЯМ] Опрос getUpdates восстановлен",
+        ])
+
     async def test_poller_saves_job_before_advancing_offset(self):
         updates = [
             {"update_id": 10, "chat": {"id": "chat-A", "type": "group"}, "from": {"login": "a"}, "text": "/обогатить"},
@@ -212,6 +241,20 @@ class EnrichDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result["error"], result["found"], budget.used), ("HTTP 429", False, 2))
         self.assertEqual(session.post.call_count, 2)
 
+    async def test_dadata_lookup_keeps_entire_response_with_time(self):
+        payload = {"suggestions": [{"value": "Головная", "data": {"kpp": "770101001"}},
+                                   {"value": "Филиал", "data": {"kpp": "770102001"}}]}
+        response = AsyncMock(status=200)
+        response.json.return_value = payload
+        session = Mock()
+        session.post.return_value = AsyncMock()
+        session.post.return_value.__aenter__.return_value = response
+        limiter = Mock(wait_turn=AsyncMock())
+        result = await enrich.dadata_lookup(session, "7707083893", asyncio.Semaphore(1), limiter)
+        self.assertEqual(result["name"], "Головная")
+        self.assertEqual(result["response"], payload)
+        self.assertTrue(result["received_at"].endswith("+00:00"))
+
     def test_pending_request_key_is_scoped_to_chat_and_sender(self):
         alice = {"login": "alice"}
         bob = {"login": "bob"}
@@ -235,20 +278,19 @@ class EnrichDeliveryTest(unittest.IsolatedAsyncioTestCase):
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.object(bot.config, "CONFIG_DIR", Path(tmp)),
+            patch.object(bot.config, "DADATA_USAGE_FILE", Path(tmp) / "legacy.json"),
             patch.object(bot.config, "DADATA_TOKEN", "test"),
             patch.object(bot.config, "enrich_module_settings", return_value=settings),
             patch.object(bot, "ym_download_file", side_effect=download),
             patch.object(bot, "ym_send_file", new=AsyncMock(return_value=[])),
             patch.object(bot, "ym_send_text", new=AsyncMock()) as send_text,
-            patch.object(enrich, "_load_dadata_usage", return_value={"count": 0}),
-            patch.object(enrich, "_save_dadata_usage") as save_usage,
             patch.object(enrich, "record_dadata_usage"),
             patch.object(enrich, "dadata_lookup", side_effect=lookup),
         ):
             await bot._handle_enrich(target, "file-id", "source.txt", target)
             remainder, = Path(tmp).glob("*_остаток.xlsx")
             self.assertEqual(enrich.extract_inns_from_xlsx(str(remainder)), inns[1:])
-        save_usage.assert_called_once_with({"count": 2})
+            self.assertEqual(enrich._load_dadata_usage()["count"], 2)
         self.assertIn("не найдено 1", send_text.await_args.args[0])
         self.assertIn("Ошибок запросов: 1", send_text.await_args.args[0])
 
@@ -267,14 +309,13 @@ class EnrichDeliveryTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(size_limit=size_limit, errors=errors), tempfile.TemporaryDirectory() as tmp:
                 with (
                     patch.object(bot.config, "CONFIG_DIR", Path(tmp)),
+                    patch.object(bot.config, "DADATA_USAGE_FILE", Path(tmp) / "legacy.json"),
                     patch.object(bot.config, "DADATA_TOKEN", "test"),
                     patch.object(bot.config, "enrich_module_settings", return_value=settings),
                     patch.object(bot, "YM_MAX_FILE_BYTES", size_limit),
                     patch.object(bot, "ym_download_file", side_effect=download),
                     patch.object(bot, "ym_send_file", new_callable=AsyncMock, return_value=errors) as send_file,
                     patch.object(bot, "ym_send_text", new_callable=AsyncMock) as send_text,
-                    patch.object(enrich, "_load_dadata_usage", return_value={"count": 0}),
-                    patch.object(enrich, "_save_dadata_usage"),
                     patch.object(enrich, "record_dadata_usage"),
                     patch.object(enrich, "dadata_lookup", return_value={"inn": "7707083893", "found": True}),
                 ):
@@ -303,6 +344,67 @@ class EnrichDeliveryTest(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("Отчёты → Обогащение ИНН", message)
                 else:
                     self.assertNotIn("Отчёты", message)
+
+    async def test_interrupted_job_reuses_responses_and_keeps_used_quota(self):
+        settings = {"enabled": True, "daily_limit": 3, "requests_per_second": 25}
+        first, second = "7707083893", "7702070139"
+        target = {"login": "test-user"}
+        second_started = asyncio.Event()
+        first_saved = asyncio.Event()
+        empty_response = {"suggestions": []}
+        stamp = "2026-11-22T10:00:00.000+00:00"
+
+        async def download(_session, _file_id, path):
+            Path(path).write_text(f"{first}\n{second}\n", encoding="utf-8", newline="\n")
+
+        async def lookup(_session, inn, _sem, _limiter, budget):
+            self.assertTrue(budget.take())
+            if inn == second:
+                second_started.set()
+                await asyncio.Future()
+            return {"inn": inn, "found": False, "response": empty_response, "received_at": stamp}
+
+        save_response = dadata_store.save_response
+
+        def save_and_signal(*args):
+            save_response(*args)
+            first_saved.set()
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(bot.config, "CONFIG_DIR", Path(tmp)),
+            patch.object(bot.config, "DADATA_USAGE_FILE", Path(tmp) / "legacy.json"),
+            patch.object(bot.config, "DADATA_TOKEN", "test"),
+            patch.object(bot.config, "enrich_module_settings", return_value=settings),
+            patch.object(bot, "ym_download_file", side_effect=download) as download_mock,
+            patch.object(bot, "ym_send_file", new=AsyncMock(return_value=[])),
+            patch.object(bot, "ym_send_text", new=AsyncMock()) as send_text,
+            patch.object(enrich, "record_dadata_usage"),
+        ):
+            with (patch.object(enrich, "dadata_lookup", side_effect=lookup),
+                  patch.object(dadata_store, "save_response", side_effect=save_and_signal)):
+                task = asyncio.create_task(bot._handle_enrich(target, "file-id", "source.txt", target, job_id=45))
+                try:
+                    await asyncio.wait_for(asyncio.gather(first_saved.wait(), second_started.wait()), timeout=3)
+                finally:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+            self.assertEqual(enrich._load_dadata_usage()["count"], 2)
+            self.assertEqual(list(dadata_store.job_responses(45)), [(first, empty_response)])
+
+            async def resumed_lookup(_session, inn, _sem, _limiter, budget):
+                self.assertEqual(inn, second)
+                self.assertTrue(budget.take())
+                return {"inn": inn, "found": False, "response": empty_response, "received_at": stamp}
+
+            with patch.object(enrich, "dadata_lookup", side_effect=resumed_lookup) as lookup_mock:
+                await bot._handle_enrich(target, "file-id", "source.txt", target, job_id=45)
+            lookup_mock.assert_awaited_once()
+            download_mock.assert_awaited_once()
+            self.assertEqual(enrich._load_dadata_usage()["count"], 3)
+            self.assertEqual(dadata_store.summary()["api_responses"], 2)
+            self.assertIn("Обработано: 2", send_text.await_args.args[0])
 
 
 if __name__ == "__main__":

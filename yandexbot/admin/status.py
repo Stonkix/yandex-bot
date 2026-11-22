@@ -46,7 +46,12 @@ def bot_status() -> list[dict]:
         if seen is None:
             continue
         age = now - seen
-        result.append({"title": title, "ok": age <= HEARTBEAT_LIMITS[key], "age": _age(age)})
+        poll_failed = key == "listen" and state.listen_error is not None
+        result.append({
+            "title": "Чат · ошибка опроса" if poll_failed else title,
+            "ok": not poll_failed and age <= HEARTBEAT_LIMITS[key],
+            "age": _age(age),
+        })
     return result
 
 
@@ -134,7 +139,10 @@ def list_reports(limit: int = 300) -> list[dict]:
     for path in paths:
         if not path.is_file() or path.suffix.lower() not in REPORT_SUFFIXES or path.name.startswith("~$"):
             continue
-        info = path.stat()
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
         items.append({
             "name": path.relative_to(config.CONFIG_DIR).as_posix(),
             "kind": report_kind(path.name),

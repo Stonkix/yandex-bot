@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block content %}
+<section class="grid grid-4">
+  <div class="card stat">
+    <div class="stat-label">Уникальных ИНН</div>
+    <div class="stat-value">{{ totals.inns|num }}</div>
+    <div class="stat-note">Записей в истории · {{ totals.total|num }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Записей с совпадениями</div>
+    <div class="stat-value">{{ totals.found|num }}</div>
+    <div class="stat-note">Без совпадений · {{ totals.not_found|num }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Полных ответов API</div>
+    <div class="stat-value">{{ totals.api_responses|num }}</div>
+    <div class="stat-note">Совпадений в ответах · {{ totals.suggestions|num }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Строк из старых Excel</div>
+    <div class="stat-value">{{ totals.imported_rows|num }}</div>
+    <div class="stat-note">Отчётов с записями · {{ totals.imported_reports|num }}</div>
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <div>
+      <h2>Выгрузка базы</h2>
+      <p class="muted small">Последний ответ API{% if last_response %} получен {{ last_response|dt(true) }}{% else %} ещё не получен{% endif %}.</p>
+    </div>
+    <a class="btn" href="{{ url_for('dadata_export') }}">{{ icon('download') }} Скачать CSV</a>
+  </div>
+  <div class="card-body">
+    <p>В CSV есть ИНН, время ответа, источник и данные в JSON. Для строк из старых Excel указано время отчёта.</p>
+    <p class="muted small">Локальные вложения и Excel-отчёты хранятся неделю. Записи в базе остаются доступны.</p>
+  </div>
+</section>
+{% endblock %}

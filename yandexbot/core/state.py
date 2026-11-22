@@ -14,6 +14,8 @@ import asyncio
 # "scheduler", "queue". Админ-панель работает в том же процессе и по нему
 # показывает, живы ли циклы; пустой словарь — бот в этом процессе не запущен.
 heartbeat: dict[str, float] = {}
+# Последняя ошибка опроса API. Цикл может работать и при недоступном API.
+listen_error: str | None = None
 
 prices_lock = asyncio.Lock()
 epd_prices_lock = asyncio.Lock()

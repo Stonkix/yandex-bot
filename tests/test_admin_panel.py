@@ -1,5 +1,7 @@
 """Проверки Flask-панели и SQLite-хранилища."""
 
+import csv
+import json
 import re
 import sqlite3
 import tempfile
@@ -13,9 +15,11 @@ from werkzeug.security import generate_password_hash
 from yandexbot.admin import server as admin_server
 from yandexbot.admin import store as admin_store
 from yandexbot.core import access, config
+from yandexbot.modules import dadata_store
 
 PASSWORD = "достаточно-длинный"
-PAGES = ["/", "/modules", "/prices", "/epd-prices", "/enrich", "/chats", "/access", "/runs", "/reports", "/logs", "/account"]
+PAGES = ["/", "/modules", "/prices", "/epd-prices", "/enrich", "/chats", "/access", "/runs", "/reports",
+         "/dadata", "/logs", "/account"]
 
 
 def _csrf(response) -> str:
@@ -146,6 +150,30 @@ class AuthTests(PanelTestCase):
         self.assertEqual(response.status_code, 302)
         self.client.post("/logout", data={"csrf": _csrf(self.client.get("/account"))})
         self.assertEqual(self.login("новый-пароль-123").status_code, 302)
+
+
+class DaDataPanelTests(PanelTestCase):
+    def test_database_and_csv_require_login(self):
+        for path in ("/dadata", "/dadata/export.csv"):
+            self.assertEqual(self.client.get(path).status_code, 302)
+
+        self.login()
+        dadata_store.init_db()
+        payload = {"suggestions": [{"value": "Организация; филиал", "data": {"phone": "+7"}}]}
+        dadata_store.save_response(1, "0123456789", "2026-11-22T10:00:00.000+00:00", payload)
+        page = self.client.get("/dadata").get_data(as_text=True)
+        self.assertIn("База DaData", page)
+        self.assertIn("Записей в истории · 1", page)
+        self.assertIn("Скачать CSV", page)
+        response = self.client.get("/dadata/export.csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        self.assertIn("attachment", response.headers["Content-Disposition"])
+        headers, row = csv.reader(response.get_data(as_text=True).splitlines(), delimiter=";")
+        self.assertEqual(headers[0], "ИНН")
+        self.assertEqual(row[:4], ["0123456789", "2026-11-22T10:00:00.000+00:00", "", "API DaData"])
+        self.assertEqual(json.loads(row[-1]), payload)
+        response.close()
 
 
 class SettingsTests(PanelTestCase):

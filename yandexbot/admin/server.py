@@ -14,14 +14,14 @@ import threading
 import time
 import tomllib
 
-from flask import Flask, abort, flash, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, Response, abort, flash, redirect, render_template, request, send_file, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from yandexbot.admin import status
 from yandexbot.admin import store as admin_store
 from yandexbot.core import access as bot_access
 from yandexbot.core import config
-from yandexbot.modules import archives
+from yandexbot.modules import archives, dadata_store
 
 MIN_PASSWORD_LENGTH = 10
 LOGIN_ATTEMPTS = 5
@@ -404,6 +404,23 @@ def create_app() -> Flask:
             by_user=status.dadata_by_user(),
         )
 
+    @app.get("/dadata")
+    def dadata_page():
+        dadata_store.init_db()
+        totals = dadata_store.summary()
+        last_response = _parse_dt(totals["last_response"])
+        return render_template("dadata.html", title="База DaData", totals=totals,
+                               last_response=last_response.astimezone() if last_response else None)
+
+    @app.get("/dadata/export.csv")
+    def dadata_export():
+        dadata_store.init_db()
+        return Response(dadata_store.csv_rows(), content_type="text/csv; charset=utf-8", headers={
+            "Content-Disposition": 'attachment; filename="dadata.csv"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
+
     @app.route("/chats", methods=["GET", "POST"])
     def chats():
         if request.method == "POST":
@@ -514,7 +531,10 @@ def create_app() -> Flask:
         path = status.report_path(name)
         if path is None:
             abort(404)
-        return send_file(path, as_attachment=True, download_name=path.name)
+        try:
+            return send_file(path, as_attachment=True, download_name=path.name)
+        except FileNotFoundError:
+            abort(404)
 
     @app.get("/logs")
     def logs():

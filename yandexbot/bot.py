@@ -36,8 +36,6 @@ import argparse
 import asyncio
 import datetime
 import logging
-import os
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -48,6 +46,7 @@ import aiohttp
 
 from yandexbot.core import access
 from yandexbot.core import config
+from yandexbot.modules import dadata_reports, dadata_store
 from yandexbot.modules import prices
 from yandexbot.modules import epd_prices
 from yandexbot.modules import enrich
@@ -319,7 +318,8 @@ async def _send_enrichment_report(output: Path, caption: str, target: dict | Non
     return f"📎 Активный лист отправлен частями ({len(parts)} файлов Excel)."
 
 
-async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dict | None):
+async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dict | None,
+                         job_id: int | None = None):
     display_name = sender.get("display_name") or sender.get("login") or "пользователь"
     if not config.enrich_module_settings()["enabled"]:
         await ym_send_text("⏸ Модуль обогащения временно отключён администратором.", target=target)
@@ -327,43 +327,53 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
     if not config.DADATA_TOKEN:
         await ym_send_text("❌ Токен DaData не настроен в config.toml ([dadata] token = ...)", target=target)
         return
+    ext = Path(file_name).suffix.lower()
+    if ext not in (".txt", ".xlsx", ".xlsm"):
+        await ym_send_text(f'❌ Неподдерживаемый формат файла "{file_name}" — нужен .txt, .xlsx или .xlsm', target=target)
+        return
     async with enrich_lock:
-        tmp_dir = tempfile.mkdtemp(prefix="enrich_")
-        ext = os.path.splitext(file_name)[1].lower()
-        local_path = os.path.join(tmp_dir, f"input{ext}")
-
         try:
-            async with aiohttp.ClientSession() as dl_session:
-                await ym_download_file(dl_session, file_id, local_path)
+            dadata_store.init_db()
+            source = dadata_reports.upload_path(ext, job_id)
+            if not source.is_file():
+                partial = source.with_suffix(f"{ext}.part")
+                try:
+                    async with aiohttp.ClientSession() as dl_session:
+                        await ym_download_file(dl_session, file_id, str(partial))
+                    partial.replace(source)
+                finally:
+                    partial.unlink(missing_ok=True)
+            local_path = str(source)
 
             if ext == ".txt":
-                inns, total_inn_values, invalid_inns = enrich.extract_inns_from_txt_with_stats(
-                    Path(local_path).read_bytes()
-                )
-            elif ext in (".xlsx", ".xlsm"):
-                inns, total_inn_values, invalid_inns = enrich.extract_inns_from_xlsx_with_stats(local_path)
+                inns, total_inn_values, invalid_inns = enrich.extract_inns_from_txt_with_stats(source.read_bytes())
             else:
-                await ym_send_text(f'❌ Неподдерживаемый формат файла "{file_name}" — нужен .txt или .xlsx', target=target)
-                return
+                inns, total_inn_values, invalid_inns = enrich.extract_inns_from_xlsx_with_stats(local_path)
 
             if not inns:
                 await ym_send_text("❌ В файле не найдено ни одного корректного ИНН.", target=target)
                 return
 
-            usage = enrich._load_dadata_usage()
-            daily_limit = config.enrich_module_settings()["daily_limit"]
-            remaining_today = daily_limit - usage["count"]
-            if remaining_today <= 0:
+            results_by_inn = {}
+            if job_id is not None:
+                allowed_inns = set(inns)
+                results_by_inn = {inn: enrich.dadata_result(inn, response)
+                                  for inn, response in dadata_store.job_responses(job_id) if inn in allowed_inns}
+            restored = len(results_by_inn)
+            settings = config.enrich_module_settings()
+            daily_limit = settings["daily_limit"]
+            remaining_today = max(0, daily_limit - enrich._load_dadata_usage()["count"])
+            if not remaining_today and not restored:
                 await ym_send_text(f"❌ Дневной лимит DaData ({daily_limit}) уже исчерпан. Попробуйте завтра.", target=target)
                 return
 
-            to_process = inns[:remaining_today]
-            skipped = len(inns) - len(to_process)
+            pending_inns = [inn for inn in inns if inn not in results_by_inn]
+            to_process = pending_inns[:remaining_today]
+            skipped = len(pending_inns) - len(to_process)
             # Повторы одного ИНН запрашиваются один раз: результат затем
             # проставляется во все строки исходной таблицы с этим ИНН.
             duplicate_inns = total_inn_values - invalid_inns - len(inns)
 
-            settings = config.enrich_module_settings()
             eta = enrich.format_duration(
                 enrich.estimate_seconds(len(to_process), settings["requests_per_second"])
             )
@@ -379,8 +389,7 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
             started_at = time.monotonic()
             sem = asyncio.Semaphore(enrich.DADATA_CONCURRENCY)
             rate_limiter = enrich.DaDataRateLimiter(settings["requests_per_second"])
-            budget = enrich.DaDataBudget(remaining_today)
-            results = []
+            budget = enrich.DaDataBudget(remaining_today, lambda: enrich.reserve_dadata_request(daily_limit))
             progress_step = 10_000
             logging.info(
                 f"[DaData] Начато обогащение: {len(to_process)} ИНН, "
@@ -394,14 +403,23 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
                     if not budget.remaining:
                         break
                     tasks = [
-                        enrich.dadata_lookup(session, inn, sem, rate_limiter, budget)
+                        asyncio.create_task(enrich.dadata_lookup(session, inn, sem, rate_limiter, budget))
                         for inn in to_process[start:start + batch_size]
                     ]
-                    for coro in asyncio.as_completed(tasks):
-                        result = await coro
-                        if not result.get("deferred"):
-                            results.append(result)
-                    processed = len(results)
+                    try:
+                        for coro in asyncio.as_completed(tasks):
+                            result = await coro
+                            response = result.pop("response", None)
+                            if response is not None:
+                                dadata_store.save_response(job_id, result["inn"], result.pop("received_at"), response)
+                            if not result.get("deferred"):
+                                results_by_inn[result["inn"]] = result
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    processed = len(results_by_inn) - restored
                     if processed % progress_step == 0 or processed == len(to_process):
                         logging.info(
                             f"[DaData] Прогресс: {processed}/{len(to_process)} ИНН"
@@ -412,11 +430,7 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
                                 target=target,
                             )
 
-            usage["count"] += budget.used
-            enrich._save_dadata_usage(usage)
-
-            order = {inn: i for i, inn in enumerate(to_process)}
-            results.sort(key=lambda r: order.get(r["inn"], 0))
+            results = [results_by_inn[inn] for inn in inns if inn in results_by_inn]
 
             found = sum(1 for r in results if r.get("found"))
             failed = sum(1 for r in results if r.get("error"))
@@ -433,6 +447,7 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
             date_str = datetime.datetime.now().strftime("%d.%m.%y_%H%M%S_%f")
             out_ext = ".xlsm" if ext == ".xlsm" else ".xlsx"
             out_path = config.CONFIG_DIR / f"enrich_{date_str}{out_ext}"
+            dadata_store.store_report(out_path.stem)
             remainder = None
             if remaining_inns:
                 remainder = out_path.with_name(f"{out_path.stem}_остаток.xlsx")
@@ -448,7 +463,7 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
                 out_path, f"ИНН: найдено {found}, не найдено {not_found}, ошибок {failed}", target,
             )
 
-            remaining_left = daily_limit - usage["count"]
+            remaining_left = max(0, daily_limit - enrich._load_dadata_usage()["count"])
             elapsed = enrich.format_duration(time.monotonic() - started_at)
             msg = (
                 f"{'⚠️' if failed else '✅'} Готово за {elapsed}. Обработано: {found + not_found} уникальных ИНН "
@@ -469,11 +484,13 @@ async def _handle_enrich(sender: dict, file_id: str, file_name: str, target: dic
                         "в админ-панель → Отчёты → Обогащение ИНН. "
                         "Если у вас нет доступа, обратитесь к администратору.")
             await ym_send_text(msg, target=target)
+        except sqlite3.Error:
+            logging.exception("[DaData] Не удалось сохранить или прочитать историю обогащения")
+            await ym_send_text("❌ Не удалось завершить обогащение. Попробуйте позже.", target=target)
+            raise
         except Exception as e:
             logging.error(f"Ошибка обогащения по команде от '{display_name}': {e}", exc_info=True)
             await ym_send_text(f"❌ Ошибка обогащения: {short_error(e)}", target=target)
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 async def _dispatch_enrich(context: CommandContext) -> None:
@@ -720,20 +737,31 @@ async def listen_commands():
         f"во всех чатах бота…", flush=True,
     )
 
+    last_error_log_at = float("-inf")
     async with aiohttp.ClientSession() as session:
         while True:
             state.heartbeat["listen"] = time.time()
             try:
                 data = await ym_get_updates(session, offset=offset, limit=10)
             except Exception as e:
-                logging.error(f"[ЯМ] Ошибка getUpdates: {e}")
+                poll_error = f"Ошибка getUpdates: {short_error(e)}"
+            else:
+                poll_error = None
+                if not data.get("ok"):
+                    poll_error = f"getUpdates вернул ошибку: {data.get('description')}"
+
+            previous_error = state.listen_error
+            state.listen_error = poll_error
+            if poll_error is not None:
+                now = time.monotonic()
+                if poll_error != previous_error or now - last_error_log_at >= 60:
+                    logging.error("[ЯМ] %s", poll_error)
+                    last_error_log_at = now
                 await asyncio.sleep(5)
                 continue
 
-            if not data.get("ok"):
-                logging.error(f"[ЯМ] getUpdates вернул ошибку: {data.get('description')}")
-                await asyncio.sleep(5)
-                continue
+            if previous_error is not None:
+                logging.info("[ЯМ] Опрос getUpdates восстановлен")
 
             updates = data.get("updates", [])
             for upd in updates:
@@ -775,7 +803,7 @@ async def _run_chat_jobs(kind: str) -> None:
         try:
             sender, chat, target = payload["sender"], payload["chat"], payload["target"]
             if kind == "enrich" and _enrich_allowed_here(chat, sender):
-                await _handle_enrich(sender, payload["file"]["id"], payload["file"]["name"], target)
+                await _handle_enrich(sender, payload["file"]["id"], payload["file"]["name"], target, job_id=update_id)
             elif kind == "prices" and _prices_allowed_here(chat, sender) and config.prices_module_settings()["enabled"]:
                 await _handle_prices(payload["display_name"], target)
             elif kind == "epd_prices" and _prices_allowed_here(chat, sender) and config.epd_prices_module_settings()["enabled"]:
@@ -795,11 +823,24 @@ async def _run_chat_jobs(kind: str) -> None:
                 await asyncio.sleep(3)
 
 
+async def _maintain_enrichment_files() -> None:
+    while True:
+        try:
+            async with enrich_lock:
+                await asyncio.to_thread(dadata_reports.maintain_files)
+        except (OSError, sqlite3.Error):
+            logging.exception("[DaData] Не удалось выполнить очистку отчётов")
+        await asyncio.sleep(3600)
+
+
 async def _listen_with_jobs() -> None:
     recovered = admin_store.recover_chat_jobs(config.ADMIN_DB_PATH)
     if recovered:
         logging.info("[ЯМ] Восстановлено заданий: %s", recovered)
-    await asyncio.gather(_listen_forever(), *(_run_chat_jobs(kind) for kind in ("prices", "epd_prices", "enrich")))
+    await asyncio.gather(
+        _listen_forever(), _maintain_enrichment_files(),
+        *(_run_chat_jobs(kind) for kind in ("prices", "epd_prices", "enrich")),
+    )
 
 
 async def _daemon_forever():

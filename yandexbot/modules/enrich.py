@@ -9,6 +9,7 @@ import datetime
 import json
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import aiohttp
@@ -17,6 +18,7 @@ from openpyxl.utils import get_column_letter
 
 from yandexbot.core import config
 from yandexbot.core.utils import BOLD, CENTER, RED
+from yandexbot.modules import dadata_store
 
 DADATA_URL       = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
 # Ограничение DaData — до 30 запросов в секунду. Оставляем запас и равномерно
@@ -121,35 +123,39 @@ class DaDataRateLimiter:
 
 
 class DaDataBudget:
-    def __init__(self, limit: int):
+    def __init__(self, limit: int, reserve: Callable[[], bool] | None = None):
         self.remaining = limit
         self.used = 0
+        self._reserve = reserve
 
     def take(self) -> bool:
-        if not self.remaining:
+        if not self.remaining or (self._reserve is not None and not self._reserve()):
+            self.remaining = 0
             return False
         self.remaining -= 1
         self.used += 1
         return True
 
 
-def _load_dadata_usage() -> dict:
-    today = datetime.date.today().isoformat()
+def _legacy_usage_count(today: str) -> int:
     if config.DADATA_USAGE_FILE.is_file():
         try:
             data = json.loads(config.DADATA_USAGE_FILE.read_text(encoding="utf-8"))
             if data.get("date") == today:
-                return data
-        except Exception:
+                return max(0, int(data.get("count", 0)))
+        except (OSError, ValueError, TypeError, AttributeError):
             pass
-    return {"date": today, "count": 0}
+    return 0
 
 
-def _save_dadata_usage(usage: dict):
-    try:
-        config.DADATA_USAGE_FILE.write_text(json.dumps(usage, ensure_ascii=False), encoding="utf-8", newline="\n")
-    except Exception as e:
-        logging.error(f"Не удалось сохранить {config.DADATA_USAGE_FILE}: {e}")
+def _load_dadata_usage() -> dict:
+    today = datetime.date.today().isoformat()
+    return {"date": today, "count": dadata_store.request_count(today, _legacy_usage_count(today))}
+
+
+def reserve_dadata_request(limit: int) -> bool:
+    today = datetime.date.today().isoformat()
+    return dadata_store.reserve_request(today, limit, _legacy_usage_count(today))
 
 
 def _load_dadata_stats() -> list[dict]:
@@ -442,9 +448,9 @@ async def dadata_lookup(session: aiohttp.ClientSession, inn: str,
     for attempt in range(3):
         pause = 2 ** attempt
         async with sem:
+            await rate_limiter.wait_turn()
             if budget is not None and not budget.take():
                 return {"inn": inn, "found": False, "error": error, "deferred": error is None}
-            await rate_limiter.wait_turn()
             try:
                 async with session.post(
                     DADATA_URL, json={"query": inn}, headers=headers,
@@ -455,6 +461,7 @@ async def dadata_lookup(session: aiohttp.ClientSession, inn: str,
                         suggestions = data.get("suggestions") if isinstance(data, dict) else None
                         if not isinstance(suggestions, list) or (suggestions and not isinstance(suggestions[0], dict)):
                             return {"inn": inn, "found": False, "error": "некорректный ответ DaData"}
+                        received_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="milliseconds")
                         break
                     error = f"HTTP {resp.status}"
                     if resp.status != 429 and not 500 <= resp.status < 600:
@@ -471,6 +478,16 @@ async def dadata_lookup(session: aiohttp.ClientSession, inn: str,
     else:
         logging.warning("[DaData] запрос не выполнен: %s", error)
         return {"inn": inn, "found": False, "error": error}
+
+    result = dadata_result(inn, data)
+    if not result.get("error"):
+        result.update(response=data, received_at=received_at)
+    return result
+
+
+def dadata_result(inn: str, response: dict) -> dict:
+    """Проекция первого совпадения для Excel. История сохраняет полный ответ."""
+    suggestions = response["suggestions"]
     if not suggestions:
         return {"inn": inn, "found": False}
 

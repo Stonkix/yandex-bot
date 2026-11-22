@@ -72,7 +72,7 @@ import sys
 from contextlib import closing
 from pathlib import Path
 
-for name in ("admin.db", "prices.db"):
+for name in ("admin.db", "prices.db", "dadata.db"):
     path = Path("stat", name).resolve()
     if path.is_file():
         with (
