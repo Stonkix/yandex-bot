@@ -21,18 +21,22 @@ class PricesModuleSettingsTests(unittest.TestCase):
                         "at": "01:45",
                         "sbis_delay_sec": "2.5",
                         "kontur_region_delay_sec": "17",
+                        "kontur_region_delay_max_sec": "25",
                     },
                     "manual": {
                         "sbis_delay_sec": "0.1",
                         "kontur_region_delay_sec": "0.2",
+                        "kontur_region_delay_max_sec": "0.6",
                         "main_files_only": True,
                     },
                 })
                 self.assertEqual(config.prices_run_settings("auto"), {
                     "sbis_delay_sec": 2.5, "kontur_region_delay_sec": 17.0,
+                    "kontur_region_delay_max_sec": 25.0,
                 })
                 self.assertEqual(config.prices_run_settings("manual"), {
                     "sbis_delay_sec": 0.1, "kontur_region_delay_sec": 0.2,
+                    "kontur_region_delay_max_sec": 0.6,
                 })
                 self.assertTrue(config.prices_module_settings()["manual"]["main_files_only"])
                 self.assertEqual(config.prices_auto_schedule(), {

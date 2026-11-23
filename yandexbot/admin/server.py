@@ -330,10 +330,12 @@ def create_app() -> Flask:
                         "at": form["at"], "only_changes": "only_changes" in form,
                         "sbis_delay_sec": form["auto_sbis_delay_sec"],
                         "kontur_region_delay_sec": form["auto_kontur_region_delay_sec"],
+                        "kontur_region_delay_max_sec": form.get("auto_kontur_region_delay_max_sec", form["auto_kontur_region_delay_sec"]),
                     },
                     "manual": {
                         "sbis_delay_sec": form["manual_sbis_delay_sec"],
                         "kontur_region_delay_sec": form["manual_kontur_region_delay_sec"],
+                        "kontur_region_delay_max_sec": form.get("manual_kontur_region_delay_max_sec", form["manual_kontur_region_delay_sec"]),
                         "main_files_only": "main_files_only" in form,
                     },
                     "broadcast_chats": _selected_chats(current["broadcast_chats"]),

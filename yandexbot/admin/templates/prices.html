@@ -25,9 +25,12 @@
             <label class="field">Пауза СБИС, с
               <input type="number" name="auto_sbis_delay_sec" min="0" step="0.1" value="{{ auto.sbis_delay_sec }}" required>
               <small>между регионами</small></label>
-            <label class="field">Пауза Контур, с
+            <label class="field">Пауза Контур от, с
               <input type="number" name="auto_kontur_region_delay_sec" min="0" step="0.1" value="{{ auto.kontur_region_delay_sec }}" required>
-              <small>между регионами</small></label>
+              <small>мин. пауза между регионами</small></label>
+            <label class="field">Пауза Контур до, с
+              <input type="number" name="auto_kontur_region_delay_max_sec" min="0" step="0.1" value="{{ auto.kontur_region_delay_max_sec or auto.kontur_region_delay_sec }}" required>
+              <small>разброс (джиттер) задержки</small></label>
           </div>
         </div>
       </fieldset>
@@ -38,8 +41,12 @@
           <div class="form-grid">
             <label class="field">Пауза СБИС, с
               <input type="number" name="manual_sbis_delay_sec" min="0" step="0.1" value="{{ manual.sbis_delay_sec }}" required></label>
-            <label class="field">Пауза Контур, с
-              <input type="number" name="manual_kontur_region_delay_sec" min="0" step="0.1" value="{{ manual.kontur_region_delay_sec }}" required></label>
+            <label class="field">Пауза Контур от, с
+              <input type="number" name="manual_kontur_region_delay_sec" min="0" step="0.1" value="{{ manual.kontur_region_delay_sec }}" required>
+              <small>мин. пауза</small></label>
+            <label class="field">Пауза Контур до, с
+              <input type="number" name="manual_kontur_region_delay_max_sec" min="0" step="0.1" value="{{ manual.kontur_region_delay_max_sec or manual.kontur_region_delay_sec }}" required>
+              <small>разброс (джиттер)</small></label>
           </div>
         </div>
       </fieldset>

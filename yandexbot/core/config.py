@@ -204,9 +204,9 @@ def prices_run_settings(profile: str) -> dict[str, float]:
     source_defaults = _PRICES_MANUAL_CONFIG if profile == "manual" else _PRICES_AUTO_CONFIG
     source = {**source_defaults, **overrides.get(profile, {})}
     defaults = (
-        {"sbis_delay_sec": 0.3, "kontur_region_delay_sec": 1.0}
+        {"sbis_delay_sec": 0.3, "kontur_region_delay_sec": 1.0, "kontur_region_delay_max_sec": 2.0}
         if profile == "manual"
-        else {"sbis_delay_sec": 1.0, "kontur_region_delay_sec": 10.0}
+        else {"sbis_delay_sec": 1.0, "kontur_region_delay_sec": 5.0, "kontur_region_delay_max_sec": 10.0}
     )
     settings = {}
     for key, default in defaults.items():
@@ -214,6 +214,8 @@ def prices_run_settings(profile: str) -> dict[str, float]:
         if value < 0:
             raise ValueError(f"[modules.prices.{profile}] {key} не может быть отрицательным")
         settings[key] = value
+    if settings["kontur_region_delay_max_sec"] < settings["kontur_region_delay_sec"]:
+        settings["kontur_region_delay_max_sec"] = settings["kontur_region_delay_sec"]
     return settings
 
 
@@ -372,13 +374,21 @@ def save_prices_module_settings(value: dict, actor: str = "runtime") -> None:
             "only_changes": bool(auto.get("only_changes", True)),
             "sbis_delay_sec": _nonnegative_float(auto["sbis_delay_sec"], "Пауза СБИС"),
             "kontur_region_delay_sec": _nonnegative_float(
-                auto["kontur_region_delay_sec"], "Пауза Контур",
+                auto["kontur_region_delay_sec"], "Пауза Контур от",
+            ),
+            "kontur_region_delay_max_sec": _nonnegative_float(
+                auto.get("kontur_region_delay_max_sec", auto["kontur_region_delay_sec"]),
+                "Пауза Контур до",
             ),
         },
         "manual": {
             "sbis_delay_sec": _nonnegative_float(manual["sbis_delay_sec"], "Пауза СБИС"),
             "kontur_region_delay_sec": _nonnegative_float(
-                manual["kontur_region_delay_sec"], "Пауза Контур",
+                manual["kontur_region_delay_sec"], "Пауза Контур от",
+            ),
+            "kontur_region_delay_max_sec": _nonnegative_float(
+                manual.get("kontur_region_delay_max_sec", manual["kontur_region_delay_sec"]),
+                "Пауза Контур до",
             ),
             "main_files_only": bool(manual.get("main_files_only", True)),
         },

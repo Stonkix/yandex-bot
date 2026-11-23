@@ -377,6 +377,10 @@ async def parse_sbis(regions: list, progress_cb=None, delay_sec: float = 0.3,
 OB_COUNTS = [4, 9, 19, 49, 99, 199, 499]
 OB_TARIFF_NAMES = {819: "Общий Лайт", 820: "Общий", 821: "Общий +"}
 
+class KonturAccessDenied(RuntimeError):
+    """Контур ограничил доступ к странице или файлу прайса."""
+
+
 async def kontur_download_regional_price_files(
     page, region_id: int, archive_dir: Path, main_files_only: bool = False,
 ) -> list[Path]:
@@ -391,7 +395,13 @@ async def kontur_download_regional_price_files(
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
-            await page.goto(download_page, wait_until="domcontentloaded", timeout=60000)
+            response = await page.goto(download_page, wait_until="domcontentloaded", timeout=60000)
+            if response is not None and response.status == 403:
+                page_title = await page.title()
+                target_url = urlsplit(response.url)._replace(query="", fragment="").geturl()
+                raise KonturAccessDenied(
+                    f"{tag} HTTP 403 при открытии {target_url}, title: {page_title!r}"
+                )
             await asyncio.sleep(2)
             links = await page.evaluate("""
                 () => Array.from(document.querySelectorAll('a[href]')).map(a => ({
@@ -424,6 +434,9 @@ async def kontur_download_regional_price_files(
                 filename = Path(urlsplit(url).path).name
                 target = region_dir / f"{index:02d}_{filename}"
                 response = await page.request.get(url, timeout=60000)
+                if response.status == 403:
+                    target_url = urlsplit(response.url)._replace(query="", fragment="").geturl()
+                    raise KonturAccessDenied(f"{tag} HTTP 403 при скачивании {target_url}")
                 if not response.ok:
                     raise RuntimeError(f"не удалось скачать {filename}: HTTP {response.status}")
                 target.write_bytes(await response.body())
@@ -432,6 +445,9 @@ async def kontur_download_regional_price_files(
                 saved.append(target)
             print(f"{tag} сохранено файлов: {len(saved)}", flush=True)
             return saved
+        except KonturAccessDenied as e:
+            logging.error("%s", e)
+            raise
         except Exception as e:
             if attempt == attempts:
                 raise RuntimeError(
@@ -1137,6 +1153,7 @@ def _parse_widget_html(html_str: str) -> list[dict]:
 
 async def parse_kontur(
     regions: list, source_dir: Path, progress_cb=None, region_delay_sec: float = 1.0,
+    region_delay_max_sec: float | None = None,
     main_files_only: bool = False,
 ) -> tuple:
     rows_by_region: dict[str, dict] = {}
@@ -1263,7 +1280,14 @@ async def parse_kontur(
 
             if progress_cb:
                 await progress_cb(done, total, region_name)
-            await asyncio.sleep(region_delay_sec)
+            if region_delay_sec > 0:
+                max_sec = max(
+                    region_delay_sec,
+                    region_delay_max_sec if region_delay_max_sec is not None else (region_delay_sec * 1.5),
+                )
+                await asyncio.sleep(random.uniform(region_delay_sec, max_sec))
+            else:
+                await asyncio.sleep(0)
 
         await browser.close()
 
@@ -1684,6 +1708,7 @@ async def run_sbis(delay_sec: float = 0.3, sources_dir: Path | None = None,
 
 async def run_kontur(
     regions: list, test: bool = False, region_delay_sec: float = 1.0,
+    region_delay_max_sec: float | None = None,
     main_files_only: bool = False, sources_dir: Path | None = None,
     run_kind: str | None = None,
 ) -> dict:
@@ -1719,6 +1744,7 @@ async def run_kontur(
         source_dir = Path(tempfile.mkdtemp(prefix="kontur_sources_"))
         rows_k, db_k, msb_o, ob_o, docx_o, sb_o, other_o, incomplete_regions = await parse_kontur(
             regions, source_dir, progress_hook, region_delay_sec=region_delay_sec,
+            region_delay_max_sec=region_delay_max_sec,
             main_files_only=main_files_only,
         )
         if not db_k:
@@ -1844,6 +1870,7 @@ async def run(source: str, announce: bool = False, announce_text: str | None = N
             results.append(await run_kontur(
                 REGIONS_KONTUR,
                 region_delay_sec=run_settings["kontur_region_delay_sec"],
+                region_delay_max_sec=run_settings.get("kontur_region_delay_max_sec"),
                 main_files_only=manual_files_only,
                 sources_dir=sources_dir,
                 run_kind=run_kind,
@@ -1852,6 +1879,7 @@ async def run(source: str, announce: bool = False, announce_text: str | None = N
             results.append(await run_kontur(
                 TEST_REGIONS, test=True, main_files_only=manual_files_only,
                 region_delay_sec=run_settings["kontur_region_delay_sec"],
+                region_delay_max_sec=run_settings.get("kontur_region_delay_max_sec"),
             ))
         if sources_dir is not None and all(r["ok"] and r.get("file") for r in results):
             try:

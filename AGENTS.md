@@ -1,9 +1,11 @@
 # Контекст проекта
 
+Согласованные термины и актуальное поведение очередей, выгрузок и обогащения описаны в [CONTEXT.md](CONTEXT.md).
+
 Это бот Яндекс Мессенджера для двух независимых задач:
 
 - выгрузка цен конкурентов СБИС и Контур.Экстерн в Excel и SQLite;
-- обогащение ИНН из `.txt`/`.xlsx` через DaData.
+- обогащение ИНН из `.txt`/`.xlsx`/`.xlsm` через DaData.
 
 ## Структура
 
@@ -11,14 +13,14 @@
 main.py                  единая точка запуска (PM2): бот, планировщик, очередь панели, Flask-админка
 config/                  config.toml (секреты), chats.toml, config.modules.example.toml
 yandexbot/
-  bot.py                 polling чата, команды, очередь заданий панели; CLI: python -m yandexbot.bot
+  bot.py                 polling чата, команды, очереди чата и панели; CLI: python -m yandexbot.bot
   core/                  config.py (пути, конфиг, лог), access.py, state.py, utils.py, module_registry.py
   messenger/             ym_api.py (Bot API Яндекс Мессенджера), seen_log.py
   admin/                 server.py (Flask-маршруты), status.py (данные для страниц), store.py (SQLite admin.db),
                          templates/ (Jinja, автоэкранирование), static/admin.css
   modules/               prices.py (1СО СБИС/Контур), epd_prices.py (ЭПД), enrich.py (DaData), archives.py (архивы исходников)
 tests/                   unit-тесты без сети
-scripts/                 ручные живые прогоны: epd_prices_live_test.py, kontur_live_test.py, seen_ids.py
+scripts/                 ручные прогоны и обновление Windows-сервера: update_windows.ps1
 stat/                    runtime-данные: prices.db, admin.db, лог, отчёты (путь не менять); архивы исходников — stat/archive/
 ```
 

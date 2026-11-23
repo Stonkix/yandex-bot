@@ -95,6 +95,36 @@ class KonturParserTests(unittest.TestCase):
         self.assertEqual(page.goto_calls, 2)
         self.assertEqual(len(files), 3)
 
+    def test_logs_and_reports_http_403_access_restriction(self):
+        url = "https://www.kontur-extern.ru/price-download/77"
+        page = _PriceDownloadPage()
+        page.goto = AsyncMock(return_value=Mock(status=403, url=url + "?private=value"))
+        page.title = AsyncMock(return_value="Доступ ограничен")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertLogs(level="ERROR") as logs:
+                with self.assertRaisesRegex(prices.KonturAccessDenied, "HTTP 403"):
+                    asyncio.run(prices.kontur_download_regional_price_files(page, 77, Path(directory)))
+
+        page.goto.assert_awaited_once()
+        self.assertFalse(page.request.urls)
+        self.assertIn(url, logs.output[0])
+        self.assertIn("Доступ ограничен", logs.output[0])
+        self.assertNotIn("private=value", logs.output[0])
+
+    def test_does_not_retry_http_403_for_price_file(self):
+        url = "https://www.kontur-extern.ru/Files/Modules/ExternPriceList/81_pricelist.docx"
+        page = _PriceDownloadPage()
+        page.request.get = AsyncMock(return_value=Mock(status=403, url=url + "?private=value"))
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(prices.asyncio, "sleep", new=AsyncMock()), self.assertLogs(level="ERROR") as logs:
+                with self.assertRaisesRegex(prices.KonturAccessDenied, "HTTP 403"):
+                    asyncio.run(prices.kontur_download_regional_price_files(page, 77, Path(directory)))
+
+        page.request.get.assert_awaited_once()
+        self.assertEqual(page.goto_calls, 1)
+        self.assertIn(url, logs.output[0])
+        self.assertNotIn("private=value", logs.output[0])
+
 
 class SbisPriceListTests(unittest.TestCase):
     def test_new_nomenclatures_reach_history_and_excel(self):
