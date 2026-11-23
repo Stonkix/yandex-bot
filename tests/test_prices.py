@@ -484,6 +484,27 @@ class KonturPriceListParsingTests(unittest.TestCase):
             "03_96_pricelist.pdf", "04_40_pricelist.pdf", "05_112_pricelist.pdf",
         ])
 
+    def test_parse_kontur_with_region_delay_sleeps_with_random(self):
+        browser = Mock(close=AsyncMock(), new_context=AsyncMock(return_value=Mock(new_page=AsyncMock())))
+        playwright = AsyncMock()
+        playwright.__aenter__.return_value.chromium.launch = AsyncMock(return_value=browser)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            docx = folder / "part2.docx"
+            _make_part2_docx(str(docx))
+            with (
+                patch("builtins.print"),
+                patch.object(prices, "async_playwright", return_value=playwright),
+                patch.object(prices, "kontur_download_regional_price_files", new=AsyncMock(return_value=[docx])),
+                patch("asyncio.sleep", new=AsyncMock()) as mock_sleep,
+            ):
+                asyncio.run(
+                    prices.parse_kontur([(1, "Адыгея")], folder, region_delay_sec=0.5, region_delay_max_sec=1.0)
+                )
+                self.assertTrue(mock_sleep.called)
+                sleep_val = mock_sleep.call_args[0][0]
+                self.assertTrue(0.5 <= sleep_val <= 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
